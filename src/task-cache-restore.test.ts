@@ -95,6 +95,25 @@ describe("restoreTaskCache", () => {
     expect(mockedInfo).toHaveBeenCalledWith("Task cache not found");
   });
 
+  it("reports a hit and remembers the matched key restore keys match older entry", async () => {
+    process.env.RUNNER_OS = "Linux";
+    process.env.GITHUB_RUN_ID = "12345";
+    process.env.GITHUB_RUN_ATTEMPT = "2";
+
+    mockedRestoreCacheAction.mockResolvedValue("vite-task-Linux-x64-12345-1");
+
+    await restoreTaskCache(baseInputs);
+
+    expect(mockedSetOutput).toHaveBeenCalledWith(Outputs.TaskCacheHit, true);
+    expect(mockedSaveState).toHaveBeenCalledWith(
+      State.TaskCacheMatchedKey,
+      "vite-task-Linux-x64-12345-1",
+    );
+    expect(mockedInfo).toHaveBeenCalledWith(
+      expect.stringContaining("Task cache restored from key: vite-task-Linux-x64-12345-1"),
+    );
+  });
+
   it("warns and skips when GITHUB_RUN_ID is missing", async () => {
     process.env.RUNNER_OS = "Linux";
     process.env.GITHUB_RUN_ATTEMPT = "1";

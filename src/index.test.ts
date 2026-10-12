@@ -100,6 +100,27 @@ describe("runMain sfw", () => {
   });
 });
 
+describe("runMain task cache", () => {
+  it("restores the task cache when task caching is enabled", async () => {
+    vi.mocked(resolveVitePlusVersion).mockReturnValue("latest");
+    vi.mocked(setupSfw).mockResolvedValue({ executable: "vp", sfw: false });
+    const requested = inputs(false, true, true);
+
+    await runMain(requested);
+
+    expect(mockedRestoreTaskCache).toHaveBeenCalledWith(requested);
+  });
+
+  it("skips the task cache restore when task caching is disabled", async () => {
+    vi.mocked(resolveVitePlusVersion).mockReturnValue("latest");
+    vi.mocked(setupSfw).mockResolvedValue({ executable: "vp", sfw: false });
+
+    await runMain(inputs(false, true));
+
+    expect(mockedRestoreTaskCache).not.toHaveBeenCalled();
+  });
+});
+
 describe("runPost", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -125,5 +146,46 @@ describe("runPost", () => {
 
     expect(mockedSaveCache).toHaveBeenCalledOnce();
     expect(mockedInfo).not.toHaveBeenCalled();
+  });
+
+  it("saves the task cache independently of the dep cache", async () => {
+    await runPost(inputs(false, true, true));
+
+    expect(mockedSaveCache).not.toHaveBeenCalled();
+    expect(mockedSaveTaskCache).toHaveBeenCalledOnce();
+    expect(mockedInfo).not.toHaveBeenCalled();
+  });
+
+  it("saves the task cache after dep cache when task caching is enabled", async () => {
+    await runPost(inputs(true, true, true));
+
+    expect(mockedSaveCache).toHaveBeenCalledOnce();
+    expect(mockedSaveTaskCache).toHaveBeenCalledOnce();
+  });
+
+  it("skips the task cache save when task caching is disabled", async () => {
+    await runPost(inputs(true, true));
+
+    expect(mockedSaveCache).toHaveBeenCalledOnce();
+    expect(mockedSaveTaskCache).not.toHaveBeenCalled();
+  });
+
+  it("logs and skips the task cache save when task cache saving is disabled", async () => {
+    await runPost(inputs(true, true, true, false));
+
+    expect(mockedSaveCache).toHaveBeenCalledOnce();
+    expect(mockedSaveTaskCache).not.toHaveBeenCalled();
+    expect(mockedInfo).toHaveBeenCalledWith(
+      "Task cache saving is disabled. Skipping task cache save.",
+    );
+  });
+
+  it("skips the task cache save when task cache saving is disabled and caching is off", async () => {
+    await runPost(inputs(false, true, true, false));
+
+    expect(mockedSaveTaskCache).not.toHaveBeenCalled();
+    expect(mockedInfo).toHaveBeenCalledWith(
+      "Task cache saving is disabled. Skipping task cache save.",
+    );
   });
 });
