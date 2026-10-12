@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vite-plus/test";
 import { parse as parseYaml } from "yaml";
@@ -6,6 +9,76 @@ import { parse as parseYaml } from "yaml";
 const templatePath = fileURLToPath(new URL("../../azure/setup-vp.yml", import.meta.url));
 const template = readFileSync(templatePath, "utf8");
 const docs = parseYaml(template);
+const { version } = JSON.parse(
+  readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+) as { version: string };
+
+type Shell = "bash" | "powershell";
+const prepareSteps = docs.steps.filter((step: { displayName?: string }) =>
+  step.displayName?.startsWith("setup-vp prepare"),
+) as Array<{ bash?: string; powershell?: string; env: Record<string, string> }>;
+
+function prepareStep(shell: Shell) {
+  return prepareSteps.find((step) => step[shell])!;
+}
+
+function runPrepare(shell: Shell, setupRef: string) {
+  const directory = mkdtempSync(join(tmpdir(), "setup-vp-azure-template-"));
+  const download = join(directory, "download");
+  const bootstrap = join(directory, "bootstrap");
+  const marker = join(directory, "injected");
+  // Render the real template source as Azure would, so reintroducing inline
+  // parameter interpolation makes the injection payloads executable again.
+  const script = prepareStep(shell)
+    [shell]!.replaceAll("${{ parameters.setupRef }}", () => setupRef)
+    .replaceAll("$(Agent.TempDirectory)", () => directory);
+  const prelude =
+    shell === "bash"
+      ? `
+curl() {
+  printf '%s' "$6" > "$SETUP_VP_TEST_DOWNLOAD"
+  printf '%s\\n' 'printf "%s" "$SETUP_VP_SETUP_REF" > "$SETUP_VP_TEST_BOOTSTRAP"' > "$8"
+}
+`
+      : `
+function Invoke-WebRequest {
+  param([string]$Uri, [string]$OutFile, [int]$TimeoutSec)
+  [IO.File]::WriteAllText($env:SETUP_VP_TEST_DOWNLOAD, $Uri)
+  Set-Content -LiteralPath $OutFile -Value '[IO.File]::WriteAllText($env:SETUP_VP_TEST_BOOTSTRAP, $env:SETUP_VP_SETUP_REF)'
+}
+`;
+  const scriptPath = join(directory, shell === "bash" ? "prepare.sh" : "prepare.ps1");
+  writeFileSync(scriptPath, prelude + script);
+  try {
+    const result = spawnSync(
+      shell === "bash" ? "bash" : "powershell.exe",
+      shell === "bash"
+        ? [scriptPath]
+        : ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
+      {
+        encoding: "utf8",
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          AGENT_TEMPDIRECTORY: directory,
+          SETUP_VP_SETUP_REF: setupRef,
+          SETUP_VP_TEST_DOWNLOAD: download,
+          SETUP_VP_TEST_BOOTSTRAP: bootstrap,
+          SETUP_VP_TEST_MARKER: marker,
+        },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    return {
+      ...result,
+      download: existsSync(download) ? readFileSync(download, "utf8") : undefined,
+      bootstrap: existsSync(bootstrap) ? readFileSync(bootstrap, "utf8") : undefined,
+      injected: existsSync(marker),
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
 
 describe("azure/setup-vp.yml", () => {
   it("declares the documented parameters with defaults", () => {
@@ -16,14 +89,20 @@ describe("azure/setup-vp.yml", () => {
     }>;
     const byName = Object.fromEntries(parameters.map((entry) => [entry.name, entry]));
 
-    expect(byName.version).toMatchObject({ type: "string", default: "latest" });
+    expect(byName.version).toMatchObject({ type: "string", default: "" });
+    expect(byName.versionFile).toMatchObject({ type: "string", default: "" });
+    expect(byName.nodeVersionFile).toMatchObject({ type: "string", default: "" });
+    expect(byName.bootstrapNodeVersion).toMatchObject({ type: "string", default: "24.x" });
+    expect(byName.stepName).toMatchObject({ type: "string", default: "setupVp" });
     expect(byName.workingDirectory).toMatchObject({ type: "string", default: "." });
     expect(byName.runInstall).toMatchObject({ type: "object", default: true });
     expect(byName.sfw).toMatchObject({ type: "boolean", default: false });
     expect(byName.registryUrl).toMatchObject({ type: "string", default: "" });
+    expect(byName.authEnv).toMatchObject({ type: "object", default: {} });
     expect(byName.scope).toMatchObject({ type: "string", default: "" });
-    expect(byName.setupRef).toMatchObject({ type: "string", default: "v1.17.0" });
-    expect(byName.nodeVersion).toMatchObject({ type: "string", default: "24.x" });
+    expect(byName.setupRef).toMatchObject({ type: "string", default: `v${version}` });
+    expect(byName.nodeVersion).toMatchObject({ type: "string", default: "" });
+    expect(byName.packageManager).toMatchObject({ type: "object", default: "" });
     expect(byName.nodeManager).toMatchObject({ type: "string", default: "" });
     expect(byName.cache).toMatchObject({ type: "boolean", default: false });
     expect(byName.cacheDependencyPath).toMatchObject({ type: "string", default: "" });
@@ -42,6 +121,9 @@ describe("azure/setup-vp.yml", () => {
 
   it("serializes runInstall with convertToJson and avoids main downloads", () => {
     expect(template).toContain("${{ convertToJson(parameters.runInstall) }}");
+    expect(
+      template.split("SETUP_VP_PACKAGE_MANAGER: ${{ convertToJson(parameters.packageManager) }}"),
+    ).toHaveLength(3);
     expect(template).not.toMatch(/setup-vp\/main\//);
     expect(template).toContain("$(SETUP_VP_LOCK_FILE)");
     expect(template).toContain("cacheHitVar: SETUP_VP_CACHE_HIT");
@@ -52,6 +134,10 @@ describe("azure/setup-vp.yml", () => {
     expect(template).toContain("Windows_NT");
     expect(template).toContain("bootstrap.sh");
     expect(template).toContain("bootstrap.ps1");
+    expect(template).toContain("name: ${{ parameters.stepName }}Windows");
+    expect(template).toContain("name: ${{ parameters.stepName }}Unix");
+    expect(template.match(/\$\(SETUP_VP_BOOTSTRAP_NODE\)/g)).toHaveLength(2);
+    expect(template.split("${{ insert }}: ${{ parameters.authEnv }}")).toHaveLength(3);
   });
 
   it("selects the agent shell at runtime", () => {
@@ -64,4 +150,62 @@ describe("azure/setup-vp.yml", () => {
       "condition: and(succeeded(), ne(variables['Agent.OS'], 'Windows_NT'))",
     );
   });
+
+  it.each(["bash", "powershell"] as const)(
+    "passes setupRef only through %s's environment",
+    (shell) => {
+      const step = prepareStep(shell);
+      expect(step.env.SETUP_VP_SETUP_REF).toBe("${{ parameters.setupRef }}");
+      expect(step[shell]).not.toContain("${{");
+    },
+  );
+
+  for (const shell of ["bash", "powershell"] as const) {
+    describe.skipIf((shell === "powershell") !== (process.platform === "win32"))(
+      `${shell} prepare`,
+      () => {
+        it.each([`v${version}`, "a".repeat(40), "refs/tags/v1.21.1", "feature/test_ref-1"])(
+          "downloads and runs the bootstrap for %s",
+          (setupRef) => {
+            const result = runPrepare(shell, setupRef);
+            expect(result.status, result.stderr).toBe(0);
+            const extension = shell === "bash" ? "sh" : "ps1";
+            expect(result.download).toBe(
+              `https://raw.githubusercontent.com/voidzero-dev/setup-vp/${setupRef}/azure/bootstrap.${extension}`,
+            );
+            expect(result.bootstrap).toBe(setupRef);
+            expect(result.injected).toBe(false);
+          },
+        );
+
+        it.each([
+          "",
+          "../other-repo/main",
+          "refs/../main",
+          "refs/./main",
+          "refs//main",
+          "v1%2f..",
+          "v1?query",
+          "v1#fragment",
+          "v1 with spaces",
+          "v1\n",
+          "v1\r\n",
+          shell === "bash"
+            ? 'v1"; printf injected > "$SETUP_VP_TEST_MARKER"; exit 0; #'
+            : 'v1"; Set-Content -LiteralPath $env:SETUP_VP_TEST_MARKER -Value injected; exit 0; #',
+          shell === "bash"
+            ? '$(printf injected > "$SETUP_VP_TEST_MARKER")'
+            : "$(Set-Content -LiteralPath $env:SETUP_VP_TEST_MARKER -Value injected)",
+          '`printf injected > "$SETUP_VP_TEST_MARKER"`',
+        ])("rejects unsafe setupRef %j before downloading or executing commands", (setupRef) => {
+          const result = runPrepare(shell, setupRef);
+          expect(result.injected).toBe(false);
+          expect(result.download).toBeUndefined();
+          expect(result.bootstrap).toBeUndefined();
+          expect(result.status).not.toBe(0);
+          expect(result.stderr).toContain("invalid setupRef");
+        });
+      },
+    );
+  }
 });

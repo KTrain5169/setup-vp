@@ -34,7 +34,10 @@ const baseInputs: Inputs = {
   sfw: true,
   cache: false,
   taskCache: false,
+  cacheSave: true,
 };
+
+const sfwCommand = { executable: "/trusted/sfw", sfw: true };
 
 const mockedExec = vi.mocked(getExecOutput);
 
@@ -76,7 +79,7 @@ describe("runViteInstall sfw retry", () => {
   it("runs once and succeeds without retry", async () => {
     mockedExec.mockResolvedValueOnce(execResult(0));
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(1);
     expect(setFailed).not.toHaveBeenCalled();
@@ -89,13 +92,13 @@ describe("runViteInstall sfw retry", () => {
       .mockResolvedValueOnce(execResult(0)) // warm-up
       .mockResolvedValueOnce(execResult(0)); // retry
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(3);
-    expect(mockedExec.mock.calls[0]?.[0]).toBe("sfw");
+    expect(mockedExec.mock.calls[0]?.[0]).toBe(`"${sfwCommand.executable}"`);
     expect(mockedExec.mock.calls[1]?.[0]).toBe("powershell.exe");
     expect(mockedExec.mock.calls[1]?.[1]).toEqual(["-NoProfile", "-Command", "Get-Command vp"]);
-    expect(mockedExec.mock.calls[2]?.[0]).toBe("sfw");
+    expect(mockedExec.mock.calls[2]?.[0]).toBe(`"${sfwCommand.executable}"`);
     expect(mockedExec.mock.calls[2]?.[1]).toEqual(["vp", "install"]);
     expect(warning).toHaveBeenCalledTimes(1);
     expect(setFailed).not.toHaveBeenCalled();
@@ -107,10 +110,10 @@ describe("runViteInstall sfw retry", () => {
       .mockResolvedValueOnce(execResult(1, SFW_NOT_FOUND_STDERR))
       .mockResolvedValueOnce(execResult(0)); // retry
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(2);
-    expect(mockedExec.mock.calls[1]?.[0]).toBe("sfw");
+    expect(mockedExec.mock.calls[1]?.[0]).toBe(`"${sfwCommand.executable}"`);
     expect(setFailed).not.toHaveBeenCalled();
   });
 
@@ -118,7 +121,7 @@ describe("runViteInstall sfw retry", () => {
     stubPlatform("win32");
     mockedExec.mockResolvedValueOnce(execResult(1, "ERR_PNPM_FETCH_404 not found"));
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(1);
     expect(setFailed).toHaveBeenCalledTimes(1);
@@ -128,7 +131,7 @@ describe("runViteInstall sfw retry", () => {
     stubPlatform("win32");
     mockedExec.mockResolvedValueOnce(execResult(1, SFW_NOT_FOUND_STDERR));
 
-    await runViteInstall({ ...baseInputs, sfw: false });
+    await runViteInstall(baseInputs, { executable: "vp", sfw: false });
 
     expect(mockedExec).toHaveBeenCalledTimes(1);
     expect(setFailed).toHaveBeenCalledTimes(1);
@@ -141,7 +144,7 @@ describe("runViteInstall sfw retry", () => {
       .mockResolvedValueOnce(execResult(0)) // warm-up
       .mockResolvedValueOnce(execResult(1, SFW_NOT_FOUND_STDERR)); // retry fails too
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(3);
     expect(setFailed).toHaveBeenCalledTimes(1);
@@ -154,7 +157,7 @@ describe("runViteInstall sfw retry", () => {
       .mockRejectedValueOnce(new Error("spawn powershell.exe ENOENT")) // warm-up
       .mockResolvedValueOnce(execResult(0)); // retry
 
-    await runViteInstall(baseInputs);
+    await runViteInstall(baseInputs, sfwCommand);
 
     expect(mockedExec).toHaveBeenCalledTimes(3);
     expect(setFailed).not.toHaveBeenCalled();

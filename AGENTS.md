@@ -1,75 +1,37 @@
 # AGENTS.md
 
-This file provides guidance to coding agents working in this repository.
+setup-vp installs [Vite+](https://viteplus.dev) (`vp`) through GitHub Actions, GitLab CI/CD, and Azure Pipelines.
 
-## Guidelines
+## Context by Task
 
-- Do not commit changes automatically. Wait for an explicit user request to commit.
-- Keep `dist/index.mjs`, `dist/gitlab/index.mjs`, and `dist/azure/index.mjs` in sync with source changes by running `vp run build` before committing.
+- For development setup, commands, and releases, follow [CONTRIBUTING.md](CONTRIBUTING.md).
+- For GitHub Actions behavior, start with `action.yml` and `src/index.ts`; input parsing and schemas live in `src/inputs.ts` and `src/types.ts`.
+- For GitLab or Azure behavior, start with `src/gitlab/index.ts` or `src/azure/index.ts` and the corresponding templates and bootstrap scripts in `gitlab/` or `azure/`. See [Integration Design](CONTRIBUTING.md#integration-design) for the design references.
+- For behavior shared across integrations, start with `src/ci/` and the corresponding adapters under `src/`, `src/gitlab/`, and `src/azure/`.
 
-## Project Overview
+## Implementation Constraints
 
-GitHub Action to set up [Vite+](https://viteplus.dev) (`vp`) with dependency caching support. The action installs Vite+ globally, can set up Node.js via `vp env use`, optionally configures registry auth, restores/saves dependency cache, and can run `vp install` with optional Socket Firewall Free (`sfw`) wrapping. GitLab and Azure Pipelines entry points reuse a dependency-light portable runtime under `src/ci/`.
-
-## Commands
-
-```bash
-# Build (required before committing - outputs to dist/)
-vp run build
-
-# Type check
-vp run typecheck
-
-# Run tests
-vp run test
-
-# Run tests in watch mode
-vp run test:watch
-
-# Check (lint + format)
-vp run check
-vp run check:fix
-```
-
-**Important:** Always run `vp run check:fix` and `vp run build` before committing. The compiled `dist/index.mjs` must be committed when source changes affect the action bundle.
-
-## Architecture
-
-The action has main and post execution phases. Both are served by `src/index.ts` / `dist/index.mjs`; the phase is selected from GitHub Actions runtime state.
-
-- **Main phase** (`runMain`):
-  1. Parse and validate inputs.
-  2. Install Vite+ globally via official bash/PowerShell install scripts.
-  3. Set up Node.js with `vp env use` when requested.
-  4. Configure registry auth from `registry-url`, or propagate auth from the project `.npmrc`.
-  5. Restore dependency cache when enabled.
-  6. Run `vp install` when requested, optionally wrapped with `sfw`.
-
-- **Post phase** (`runPost`):
-  1. Save dependency cache when enabled.
-
-### Key Modules
-
-- `src/index.ts` - Main/post orchestration and action state handling.
-- `src/inputs.ts` - Parse and validate action inputs using Zod schemas.
-- `src/types.ts` - Shared types, enums, and Zod schemas.
-- `src/install-viteplus.ts` - Install Vite+ globally via official install scripts.
-- `src/node-version-file.ts` - Resolve Node.js versions from supported version files.
-- `src/auth.ts` - Configure npm registry authentication from action inputs and repo `.npmrc`.
-- `src/cache-restore.ts` / `src/cache-save.ts` - Dependency caching via `@actions/cache`.
-- `src/run-install.ts` - Execute `vp install` entries with optional cwd/args.
-- `src/install-sfw.ts` - Install or reuse Socket Firewall Free for wrapped installs.
-- `src/utils.ts` - Lock file detection, package-manager cache paths, and shared helpers.
-- `src/ci/*` - Shared dependency-light primitives for GitLab and Azure runtimes.
-- `src/gitlab/*` - GitLab runtime adapters around `src/ci/*`.
-- `src/azure/*` - Azure Pipelines runtime and logging-command adapters.
-- `azure/setup-vp.yml` - Azure step template.
-- `gitlab/setup-vp.yml` - GitLab remote template.
-
-### Lock File Detection
-
-Auto-detects package manager from lock files: `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`.
+- Prefer shared logic under `src/ci/` for behavior used by multiple integrations. Keep `@actions/*` dependencies out of the portable runtimes.
+- Keep input parsing, templates, bootstrap scripts, and README examples aligned when changing an interface. GitLab Unix and Windows templates must expose matching inputs.
+- Preserve the standalone build entries in `vite.config.ts`. GitLab and Azure download one bundle each; they cannot depend on sibling chunks or the repository's `node_modules`.
+- Preserve function and class names in the bundle minification settings. Cache dependencies compare error names with class names.
+- Target native `vp.exe` for Windows execution. Do not add legacy `vp.cmd` compatibility.
+- When changing lock-file detection, keep `src/utils.ts` and `src/ci/cache.ts` consistent: `pnpm-lock.yaml`, `bun.lockb`, `bun.lock`, `package-lock.json`, `npm-shrinkwrap.json`, and `yarn.lock`. `bun.lockb` identifies a Bun cache; version extraction requires the text `bun.lock`.
 
 ## Testing
 
-Tests are colocated with source files (for example, `src/inputs.test.ts`). Run `vp run test` for test coverage, then run `vp run check:fix` and `vp run build` before committing.
+- Add regression tests beside the affected source files (`src/**/*.test.ts`). For shared behavior changes, check all three integrations, including template and bootstrap tests when interfaces change.
+- Build before running tests that inspect or execute `dist/`, including `src/bundle.test.ts`, `src/portable-bundles.test.ts`, and `test/cache-snapshot.test.mjs`.
+- Use [.github/workflows/test.yml](.github/workflows/test.yml) for native Windows command/cache regressions and Azure runtime smoke tests. A skipped Windows-only test does not verify Windows behavior; Azure smoke tests on GitHub runners do not verify native Azure Pipelines orchestration.
+- Follow the [GitLab E2E procedures](CONTRIBUTING.md#gitlab-end-to-end-tests) for the external suite.
+
+## Commits
+
+- Do not commit without an explicit request. A request to push authorizes staging, committing, and pushing the current task changes; exclude unrelated changes.
+- Before committing, run the [required checks](CONTRIBUTING.md#before-committing). Regenerate and commit affected `dist/` bundles with their source changes; do not edit bundles by hand.
+
+## Documentation
+
+- Keep `README.md` focused on user-facing setup, configuration, examples, and behavior. Its Contributing section must link to `CONTRIBUTING.md`.
+- Put development commands, contribution requirements, E2E procedures, dependency maintenance, and release instructions in `CONTRIBUTING.md`. Keep detailed designs and integration proposals in `rfcs/`, linked from that guide.
+- Keep `AGENTS.md` focused on agent rules, navigation, and implementation constraints. Link to contributor procedures instead of repeating them in `AGENTS.md` or `README.md`.

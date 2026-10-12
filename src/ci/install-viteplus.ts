@@ -1,0 +1,166 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { spawnSync } from "node:child_process";
+import { getInstallScriptUrls, pkgPrNewCommitSha } from "./install-script-urls.js";
+import { isWindows } from "./platform.js";
+import {
+  appendFallbackBinToPath,
+  createVitePlusDirsFile,
+  getInstallScriptCommand,
+  removeVitePlusDirsFile,
+  resolveVitePlusBinDirs,
+  supportsVitePlusDirs,
+  VP_DIRS_FILE_ENV,
+} from "./vp-dirs.js";
+
+const INSTALL_MAX_ROUNDS = 2;
+const INSTALL_RETRY_DELAY_MS = 2000;
+
+export function getVitePlusHome(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const home = isWindows(platform) ? env.USERPROFILE || homedir() : env.HOME || homedir();
+  return join(home, ".vite-plus");
+}
+
+function runInstallCommand(
+  url: string,
+  env: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): number {
+  const { command, args } = getInstallScriptCommand(url, platform, env.VP_VPDIRS_AWARE === "1");
+  const spawnOptions = {
+    env: { ...process.env, ...env },
+    stdio: "inherit" as const,
+  };
+  let result = spawnSync(command, args, spawnOptions);
+  // GitLab PowerShell Desktop runners need not have PowerShell Core installed.
+  // Only fall back when the executable is missing, not when an installer fails.
+  if (
+    isWindows(platform) &&
+    (result.error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+  ) {
+    result = spawnSync("powershell.exe", args, spawnOptions);
+  }
+  if (result.error) throw result.error;
+  return result.status ?? 1;
+}
+
+export async function installVitePlus(
+  version: string,
+  options: {
+    platform?: NodeJS.Platform;
+    env?: NodeJS.ProcessEnv;
+    prependPath?: (binDir: string) => void;
+    exportPath?: (path: string) => void;
+    sleep?: (ms: number) => Promise<void>;
+    runInstall?: typeof runInstallCommand;
+    logWarningFn?: (message: string) => void;
+  } = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  const targetEnv = options.env ?? process.env;
+  const prependPath = options.prependPath;
+  const delay = options.sleep ?? sleep;
+  const runInstall = options.runInstall ?? runInstallCommand;
+  const warn = options.logWarningFn ?? console.warn;
+
+  const env: Record<string, string> = {
+    ...Object.fromEntries(
+      Object.entries(targetEnv).filter(
+        (entry): entry is [string, string] => entry[1] !== undefined,
+      ),
+    ),
+    VP_VERSION: version,
+    VITE_PLUS_VERSION: version,
+  };
+
+  const detectDirs = supportsVitePlusDirs(version);
+  const dirsFile = detectDirs ? createVitePlusDirsFile() : undefined;
+  if (dirsFile) {
+    env.VP_VPDIRS_AWARE = "1";
+    env[VP_DIRS_FILE_ENV] = dirsFile;
+  } else {
+    delete env.VP_VPDIRS_AWARE;
+    delete env[VP_DIRS_FILE_ENV];
+  }
+
+  const prVersion = pkgPrNewCommitSha(version);
+  if (prVersion) {
+    env.VP_PR_VERSION = prVersion;
+  }
+
+  // Prefer the install script pinned to the requested version's git ref. Fall
+  // back to the latest script only after all pinned sources fail (see
+  // ../ci/install-script-urls.ts for the rationale).
+  const { pinned, latest } = getInstallScriptUrls(version, platform);
+  const totalUrls = pinned.length + latest.length;
+  const maxAttempts = INSTALL_MAX_ROUNDS * totalUrls;
+  let failureReason = "";
+  let attempt = 0;
+
+  async function tryUrls(urls: string[]): Promise<boolean> {
+    for (let round = 0; round < INSTALL_MAX_ROUNDS; round += 1) {
+      for (const url of urls) {
+        attempt += 1;
+        try {
+          const exitCode = runInstall(url, env, platform);
+          if (exitCode === 0) return true;
+          failureReason = `exit code ${exitCode}`;
+        } catch (error) {
+          failureReason = error instanceof Error ? error.message : String(error);
+        }
+
+        if (attempt < maxAttempts) {
+          warn(
+            `setup-vp: failed to install Vite+ from ${url} (${failureReason}). Retrying in ${INSTALL_RETRY_DELAY_MS}ms... (attempt ${attempt + 1}/${maxAttempts})`,
+          );
+          await delay(INSTALL_RETRY_DELAY_MS);
+        }
+      }
+    }
+    return false;
+  }
+
+  function ensureBinInPath(): void {
+    const { bin, fallbackBin } = resolveVitePlusBinDirs(
+      version,
+      dirsFile,
+      join(getVitePlusHome(platform, targetEnv), "bin"),
+    );
+    const separator = isWindows(platform) ? ";" : ":";
+    if (!targetEnv.PATH?.split(separator).includes(bin)) {
+      targetEnv.PATH = `${bin}${separator}${targetEnv.PATH || ""}`;
+      prependPath?.(bin);
+    }
+    if (fallbackBin) {
+      targetEnv.PATH = appendFallbackBinToPath(targetEnv.PATH, fallbackBin, platform);
+    }
+    options.exportPath?.(targetEnv.PATH!);
+  }
+
+  try {
+    if (pinned.length > 0) {
+      if (await tryUrls(pinned)) {
+        ensureBinInPath();
+        return;
+      }
+      warn(
+        `setup-vp: could not fetch the install script pinned to Vite+ ${version}. Falling back to the latest install script. The latest script may not be compatible with ${version}.`,
+      );
+    }
+
+    if (await tryUrls(latest)) {
+      ensureBinInPath();
+      return;
+    }
+
+    throw new Error(
+      `Failed to install Vite+ after ${maxAttempts} attempts across ${totalUrls} URL(s): ${failureReason}`,
+    );
+  } finally {
+    if (dirsFile) removeVitePlusDirsFile(dirsFile);
+  }
+}

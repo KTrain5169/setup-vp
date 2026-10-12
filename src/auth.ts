@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { EOL } from "node:os";
 import { join, resolve } from "node:path";
 import { debug, exportVariable, info } from "@actions/core";
+import { analyzeProjectNpmrc } from "./ci/npmrc.js";
 
 // Literal written into `.npmrc`; pnpm/npm expand it against the env at install time.
 const NODE_AUTH_TOKEN_REF = "${NODE_AUTH_TOKEN}";
@@ -12,10 +13,6 @@ function getRunnerNpmrcPath(): string {
 
 function stripProtocol(url: string): string {
   return url.replace(/^\w+:/, "");
-}
-
-function authKeyFor(registryUrl: string): string {
-  return (stripProtocol(registryUrl) + ":_authtoken").toLowerCase();
 }
 
 function buildAuthLine(registryUrl: string): string {
@@ -100,94 +97,19 @@ function isReservedEnvVar(name: string): boolean {
   return false;
 }
 
-function analyzeProjectNpmrc(content: string): {
-  registriesNeedingAuth: string[];
-  envVarRefs: Set<string>;
-} {
-  const registries = new Set<string>();
-  const authKeys = new Set<string>();
-  const envVarRefs = new Set<string>();
-
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith(";") || line.startsWith("#")) continue;
-
-    const eq = line.indexOf("=");
-    if (eq < 0) continue;
-    const lowerKey = line.slice(0, eq).trim().toLowerCase();
-    const value = line.slice(eq + 1).trim();
-
-    if (lowerKey === "registry" || lowerKey.endsWith(":registry")) {
-      // Skip values that rely on env-var expansion — the key for the matching
-      // `_authToken` line must be a literal URL, and `${VAR}` isn't expanded
-      // inside `.npmrc` keys by npm/pnpm.
-      if (!value.includes("${")) {
-        registries.add(value.endsWith("/") ? value : value + "/");
-      }
-    }
-    if (lowerKey.startsWith("//") && lowerKey.endsWith(":_authtoken")) {
-      authKeys.add(lowerKey);
-    }
-    for (const m of value.matchAll(/\$\{(\w+)\}/g)) {
-      envVarRefs.add(m[1]!);
-    }
-  }
-
-  return {
-    registriesNeedingAuth: [...registries].filter((url) => !authKeys.has(authKeyFor(url))),
-    envVarRefs,
-  };
-}
-
-function writeSupplementalAuth(registries: string[]): void {
-  const npmrcPath = getRunnerNpmrcPath();
-  const authKeysToReplace = new Set(registries.map(authKeyFor));
-
-  const existing = readNpmrc(npmrcPath);
-  const existingLines = existing === undefined ? [] : existing.split(/\r?\n/);
-
-  const keepLines = existingLines.filter((line) => {
-    const eq = line.indexOf("=");
-    if (eq <= 0) return true;
-    return !authKeysToReplace.has(line.slice(0, eq).trim().toLowerCase());
-  });
-
-  const nextContent = [...keepLines, ...registries.map(buildAuthLine)].join(EOL);
-  exportVariable("NPM_CONFIG_USERCONFIG", npmrcPath);
-  exportVariable("PNPM_CONFIG_USERCONFIG", npmrcPath); // For pnpm 11+
-
-  if (existing === nextContent) {
-    debug(`Supplemental .npmrc at ${npmrcPath} already current`);
-    return;
-  }
-
-  writeFileSync(npmrcPath, nextContent);
-  info(`Wrote _authToken entries to ${npmrcPath} for registries: ${registries.join(", ")}`);
-}
-
 /**
- * Handle auth for the project's existing `.npmrc` without requiring
- * `registry-url` in the workflow.
+ * Re-export environment references already present in the project's `.npmrc`
+ * so they remain visible to package-manager subprocesses and subsequent steps.
  *
- * - If `.npmrc` declares a custom registry but no matching `_authToken` entry
- *   and `NODE_AUTH_TOKEN` is set, write a supplemental `_authToken=${NODE_AUTH_TOKEN}`
- *   line to `$RUNNER_TEMP/.npmrc` and point `NPM_CONFIG_USERCONFIG` at it, so the
- *   repo `.npmrc` can stay to just `@scope:registry=<url>`.
- * - For any `${VAR}` references already in the project `.npmrc`, re-export those
- *   env vars via `GITHUB_ENV` so they remain visible to package-manager
- *   subprocesses and subsequent steps.
+ * Do not add auth for repository-controlled registry URLs. Generating token
+ * entries requires an explicit `registry-url` input via configAuthentication.
  */
 export function propagateProjectNpmrcAuth(projectDir: string): void {
   const npmrcPath = join(projectDir, ".npmrc");
   const content = readNpmrc(npmrcPath);
   if (content === undefined) return;
 
-  const { registriesNeedingAuth, envVarRefs } = analyzeProjectNpmrc(content);
-
-  if (process.env.NODE_AUTH_TOKEN && registriesNeedingAuth.length > 0) {
-    writeSupplementalAuth(registriesNeedingAuth);
-    envVarRefs.add("NODE_AUTH_TOKEN");
-  }
+  const { envVarRefs } = analyzeProjectNpmrc(content);
 
   const propagatable = [...envVarRefs].filter(
     (name) => !isReservedEnvVar(name) && !!process.env[name],

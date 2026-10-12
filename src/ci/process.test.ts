@@ -1,0 +1,178 @@
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { isWindows } from "./platform.js";
+import { commandPath, getCommandOutput, run, runWithOutput } from "./process.js";
+
+const directories: string[] = [];
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  for (const directory of directories.splice(0)) {
+    // Windows can briefly retain a lock on a native executable after it exits.
+    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+describe("commandPath", () => {
+  function fixture(): { root: string; first: string; second: string; filename: string } {
+    const root = mkdtempSync(path.join(tmpdir(), "setup-vp-path-"));
+    directories.push(root);
+    const first = path.join(root, "first bin");
+    const second = path.join(root, "second bin");
+    mkdirSync(first);
+    mkdirSync(second);
+    return { root, first, second, filename: isWindows() ? "sfw.exe" : "sfw" };
+  }
+
+  it("checks PATH order, skips directories and missing entries, and never executes the result", () => {
+    const { root, first, second, filename } = fixture();
+    const env = { PATH: [path.join(root, "missing"), first, second].join(path.delimiter) };
+    mkdirSync(path.join(first, filename));
+    writeFileSync(path.join(second, filename), "not an executable program", { mode: 0o755 });
+
+    expect(commandPath("sfw", env)).toBe(path.join(second, filename));
+    expect(commandPath("sfw", {})).toBeUndefined();
+    expect(commandPath("sfw", { PATH: "" })).toBeUndefined();
+    expect(commandPath("../sfw", env)).toBeUndefined();
+    expect(commandPath(path.join(second, filename), env)).toBeUndefined();
+    expect(commandPath("", env)).toBeUndefined();
+  });
+
+  it.skipIf(isWindows())("requires execute permission and accepts executable symlinks", () => {
+    const { first, second, filename } = fixture();
+    writeFileSync(path.join(first, filename), "not executable", { mode: 0o644 });
+    writeFileSync(path.join(second, filename), "executable", { mode: 0o755 });
+    const env = { PATH: [first, second].join(path.delimiter) };
+    expect(commandPath("sfw", env)).toBe(path.join(second, filename));
+
+    chmodSync(path.join(first, filename), 0o755);
+    expect(commandPath("sfw", env)).toBe(path.join(first, filename));
+    symlinkSync(path.join(second, filename), path.join(first, "linked-sfw"));
+    expect(commandPath("linked-sfw", env)).toBe(path.join(first, "linked-sfw"));
+  });
+
+  it.skipIf(!isWindows())("accepts quoted Path entries and selects native .exe files", () => {
+    const { first, second, filename } = fixture();
+    writeFileSync(path.join(first, "sfw.cmd"), "@exit /b 1");
+    writeFileSync(path.join(first, "sfw.com"), "not an exe");
+    writeFileSync(path.join(second, filename), "native exe");
+    const env = { Path: `"${first}";"${second}"`, PATHEXT: ".CMD;.COM" };
+    expect(commandPath("sfw", env)).toBe(path.join(second, filename));
+    expect(commandPath("sfw.exe", env)).toBe(path.join(second, filename));
+  });
+
+  it("excludes a case alias on a case-insensitive volume", (context) => {
+    const { root, first, filename } = fixture();
+    const alias = path.join(root, "FIRST BIN");
+    if (!existsSync(alias)) context.skip("requires a case-insensitive volume");
+    writeFileSync(path.join(first, filename), "workspace executable", { mode: 0o755 });
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(first);
+      expect(commandPath("sfw", { PATH: alias })).toBeUndefined();
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+
+  it("keeps distinct directories that differ only in case on a case-sensitive volume", (context) => {
+    const { root, first, filename } = fixture();
+    const other = path.join(root, "FIRST BIN");
+    if (existsSync(other)) context.skip("requires a case-sensitive volume");
+    mkdirSync(other);
+    writeFileSync(path.join(first, filename), "workspace executable", { mode: 0o755 });
+    writeFileSync(path.join(other, filename), "trusted executable", { mode: 0o755 });
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(first);
+      expect(commandPath("sfw", { PATH: [first, other].join(path.delimiter) })).toBe(
+        path.join(other, filename),
+      );
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
+});
+
+describe("portable process helpers", () => {
+  it("retains native executable output and failures", async () => {
+    expect(getCommandOutput(process.execPath, ["-p", "'output'"])).toBe("output");
+    expect(getCommandOutput(process.execPath, ["-e", "process.exit(7)"])).toBeUndefined();
+    expect(() => run(process.execPath, ["-e", "process.exit(7)"])).toThrow("exited with code 7");
+    expect(await runWithOutput(process.execPath, ["-e", "process.exit(7)"])).toEqual({
+      exitCode: 7,
+      stdout: "",
+      stderr: "",
+    });
+  });
+
+  it.skipIf(!isWindows())(
+    "runs vp.exe from a directory with spaces through every helper",
+    async () => {
+      const root = mkdtempSync(path.join(tmpdir(), "setup-vp-exe-"));
+      directories.push(root);
+      const bin = path.join(root, "bin with spaces");
+      const output = path.join(root, "arguments.json");
+      mkdirSync(bin, { recursive: true });
+      copyFileSync(process.execPath, path.join(bin, "vp.exe"));
+      const script = path.join(root, "record.cjs");
+      writeFileSync(
+        script,
+        `
+const fs = require('node:fs');
+fs.writeFileSync(process.env.SETUP_VP_TEST_ARGS, JSON.stringify(process.argv.slice(2)));
+console.log('vp v0.3.1');
+process.exit(Number(process.env.SETUP_VP_TEST_EXIT || 0));
+`,
+      );
+      vi.stubEnv("PATH", `${bin}${path.delimiter}${process.env.PATH || ""}`);
+      vi.stubEnv("PATHEXT", ".COM;.EXE");
+      vi.stubEnv("SETUP_VP_TEST_ARGS", output);
+      vi.stubEnv("SETUP_VP_TEST_EXIT", "0");
+      const args = [
+        "install",
+        "",
+        "two words",
+        "a&b",
+        "(parentheses)",
+        'quoted"value',
+        "trailing\\",
+      ];
+      const commandArgs = [script, ...args];
+      // Check file identity across equivalent Windows path spellings.
+      const resolvedPath = commandPath("vp");
+      expect(resolvedPath).toBeDefined();
+      const expectedFile = statSync(path.join(bin, "vp.exe"), { bigint: true });
+      expect(statSync(resolvedPath!, { bigint: true })).toMatchObject({
+        dev: expectedFile.dev,
+        ino: expectedFile.ino,
+      });
+      run("vp", commandArgs, { cwd: root });
+      expect(JSON.parse(readFileSync(output, "utf8"))).toEqual(args);
+      const result = await runWithOutput("vp", commandArgs, { cwd: root, env: { ...process.env } });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(readFileSync(output, "utf8"))).toEqual(args);
+      expect(getCommandOutput("vp", commandArgs, { cwd: root })).toBe("vp v0.3.1");
+      expect(JSON.parse(readFileSync(output, "utf8"))).toEqual(args);
+
+      vi.stubEnv("SETUP_VP_TEST_EXIT", "7");
+      expect(() => run("vp", [script], { cwd: root })).toThrow("exited with code 7");
+      expect((await runWithOutput("vp", [script], { cwd: root })).exitCode).toBe(7);
+      expect(getCommandOutput("vp", [script], { cwd: root })).toBeUndefined();
+    },
+    // This test starts several native processes; Windows runners can exceed the default 5s.
+    30_000,
+  );
+});

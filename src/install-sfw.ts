@@ -1,21 +1,18 @@
 import { restoreCache, saveCache } from "@actions/cache";
 import { info, warning, addPath } from "@actions/core";
 import { exec } from "@actions/exec";
-import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { getSfwAssetName, isMuslLinux, SFW_RELEASE_BASE, SFW_VERSION } from "./ci/install-sfw.js";
+import { isWindows } from "./ci/platform.js";
+import { commandPath } from "./ci/process.js";
+import { resolveSfwEnabled } from "./ci/sfw.js";
+import type { InstallCommand } from "./ci/types.js";
 import type { Inputs } from "./types.js";
 
-// Pin sfw so a re-run of the same commit gets the same binary. Renovate
-// watches SFW_VERSION (see .github/renovate.json customManagers entry) and
-// opens PRs whenever SocketDev publishes a new sfw-free release, keeping
-// us close to the latest malware-detection updates without giving up
-// reproducibility. For stricter supply-chain hygiene, users can compose
-// `socketdev/action@<sha>` ahead of this action — see README "Advanced:
-// stricter supply chain via socketdev/action".
-const SFW_VERSION = "v1.15.0";
-const SFW_RELEASE_BASE = `https://github.com/SocketDev/sfw-free/releases/download/${SFW_VERSION}`;
+export { getSfwAssetName, isMuslLinux };
+
 const INSTALL_MAX_ROUNDS = 2;
 const INSTALL_RETRY_DELAY_MS = 2000;
 const CURL_TIMEOUT_FLAGS = "--connect-timeout 5 --max-time 60";
@@ -44,51 +41,17 @@ export function isSfwSupported(
   }
 }
 
-export function isMuslLinux(): boolean {
-  if (process.platform !== "linux") return false;
-  try {
-    const report = process.report?.getReport() as
-      | { header?: { glibcVersionRuntime?: string } }
-      | undefined;
-    if (report?.header && !report.header.glibcVersionRuntime) {
-      return true;
-    }
-  } catch {
-    // fall through to filesystem fallback
-  }
-  return existsSync("/etc/alpine-release");
-}
-
-export function getSfwAssetName(platform: NodeJS.Platform, arch: string, isMusl: boolean): string {
-  if (platform === "darwin") {
-    if (arch === "arm64") return "sfw-free-macos-arm64";
-    if (arch === "x64") return "sfw-free-macos-x86_64";
-  } else if (platform === "linux") {
-    if (arch === "arm64") {
-      return isMusl ? "sfw-free-musl-linux-arm64" : "sfw-free-linux-arm64";
-    }
-    if (arch === "x64") {
-      return isMusl ? "sfw-free-musl-linux-x86_64" : "sfw-free-linux-x86_64";
-    }
-  } else if (platform === "win32") {
-    if (arch === "arm64") return "sfw-free-windows-arm64.exe";
-    if (arch === "x64") return "sfw-free-windows-x86_64.exe";
-  }
-  const libcSuffix = platform === "linux" ? ` (${isMusl ? "musl" : "glibc"})` : "";
-  throw new Error(`Unsupported platform/arch for sfw: ${platform}/${arch}${libcSuffix}`);
-}
-
 function getSfwBinDir(): string {
   const tmp = process.env.RUNNER_TEMP || process.env.TMPDIR || process.env.TEMP || "/tmp";
-  return join(tmp, "sfw-bin");
+  return resolve(tmp, "sfw-bin");
 }
 
-export async function installSfw(): Promise<void> {
+export async function installSfw(): Promise<string> {
   const assetName = getSfwAssetName(process.platform, process.arch, isMuslLinux());
   const url = `${SFW_RELEASE_BASE}/${assetName}`;
   const binDir = getSfwBinDir();
   mkdirSync(binDir, { recursive: true });
-  const binPath = join(binDir, process.platform === "win32" ? "sfw.exe" : "sfw");
+  const binPath = join(binDir, isWindows() ? "sfw.exe" : "sfw");
 
   // Try the GHA cache first so we don't redownload ~130 MB on every run and
   // we get a fallback when the GitHub releases CDN flakes. Key includes the
@@ -99,12 +62,12 @@ export async function installSfw(): Promise<void> {
   try {
     const matchedKey = await restoreCache([binDir], cacheKey);
     if (matchedKey && existsSync(binPath)) {
-      if (process.platform !== "win32") {
+      if (!isWindows()) {
         chmodSync(binPath, 0o755);
       }
       addPath(binDir);
       info(`sfw restored from cache: ${matchedKey}`);
-      return;
+      return binPath;
     }
   } catch (error) {
     warning(
@@ -120,7 +83,7 @@ export async function installSfw(): Promise<void> {
     try {
       const exitCode = await runDownloadCommand(url, binPath);
       if (exitCode === 0 && existsSync(binPath)) {
-        if (process.platform !== "win32") {
+        if (!isWindows()) {
           chmodSync(binPath, 0o755);
         }
         addPath(binDir);
@@ -136,7 +99,7 @@ export async function installSfw(): Promise<void> {
             `sfw cache save failed (${error instanceof Error ? error.message : String(error)}); continuing.`,
           );
         }
-        return;
+        return binPath;
       }
       failureReason = `exit code ${exitCode}`;
     } catch (error) {
@@ -160,21 +123,11 @@ export async function installSfw(): Promise<void> {
 // Used to detect when the user composed `socketdev/action@<sha>` (or
 // installed sfw via some other means) before invoking this action.
 export function findSfwOnPath(): string | null {
-  const lookupCmd = process.platform === "win32" ? "where" : "which";
-  try {
-    const stdout = execFileSync(lookupCmd, ["sfw"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const firstLine = stdout.split(/\r?\n/).find((line) => line.trim().length > 0);
-    return firstLine ? firstLine.trim() : null;
-  } catch {
-    return null;
-  }
+  return commandPath("sfw") ?? null;
 }
 
-// Decide what to do with `sfw: true`. Returns whether `vp install` should be
-// wrapped with sfw. Centralizes all the cases and emits one log message per
+// Decide what to do with `sfw: true`. Returns the executable and whether it
+// wraps vp. Centralizes all the cases and emits one log message per
 // branch so the chosen path is always visible.
 //
 // macOS / Windows / Linux are all supported as of vite-plus v0.1.23 (older vp
@@ -182,12 +135,13 @@ export function findSfwOnPath(): string | null {
 // pins vp < 0.1.23 on macOS/Windows with sfw enabled, `sfw vp install` will
 // fail the handshake; that's a documented requirement, not something we guard
 // against here.
-export async function setupSfw(inputs: Inputs): Promise<boolean> {
-  if (!inputs.sfw) return false;
+export async function setupSfw(inputs: Inputs): Promise<InstallCommand> {
+  if (!resolveSfwEnabled(inputs.sfw, inputs.version, warning))
+    return { executable: "vp", sfw: false };
 
   if (inputs.runInstall.length === 0) {
     info("sfw was requested but `run-install` is disabled; sfw will not be invoked.");
-    return false;
+    return { executable: "vp", sfw: false };
   }
 
   // Prefer an externally-provided sfw — typically installed by a prior
@@ -197,7 +151,7 @@ export async function setupSfw(inputs: Inputs): Promise<boolean> {
   const existing = findSfwOnPath();
   if (existing) {
     info(`Using existing sfw on PATH: ${existing}`);
-    return true;
+    return { executable: existing, sfw: true };
   }
 
   if (!isSfwSupported()) {
@@ -205,16 +159,15 @@ export async function setupSfw(inputs: Inputs): Promise<boolean> {
     warning(
       `sfw has no published binary for this runner's platform/architecture (${env}) and none was found on PATH; falling back to plain \`vp install\`. To enable sfw here, install a working sfw binary on PATH in an earlier step (e.g. via \`socketdev/action@<sha>\` or a custom install).`,
     );
-    return false;
+    return { executable: "vp", sfw: false };
   }
 
-  await installSfw();
-  return true;
+  return { executable: await installSfw(), sfw: true };
 }
 
 async function runDownloadCommand(url: string, outPath: string): Promise<number> {
   const options = { ignoreReturnCode: true };
-  if (process.platform === "win32") {
+  if (isWindows()) {
     return exec(
       "pwsh",
       [

@@ -1,0 +1,115 @@
+# Contributing
+
+For setup-vp usage and configuration, see the [README](README.md).
+
+## Development
+
+### Install Vite+ CLI
+
+- Linux / macOS: `curl -fsSL https://viteplus.dev/install.sh | bash`
+- Windows: `irm https://viteplus.dev/install.ps1 | iex`
+
+### Setup
+
+```bash
+git clone https://github.com/voidzero-dev/setup-vp.git
+cd setup-vp
+vp install
+```
+
+### Available Commands
+
+| Command             | Description                  |
+| ------------------- | ---------------------------- |
+| `vp run build`      | Build the bundles in `dist/` |
+| `vp run test`       | Run tests                    |
+| `vp run test:watch` | Run tests in watch mode      |
+| `vp run typecheck`  | Check types                  |
+| `vp run check`      | Check lint and formatting    |
+| `vp run check:fix`  | Fix lint and formatting      |
+
+### Before Committing
+
+Format and build before running the tests, because some tests inspect or execute the bundles in `dist/`:
+
+```bash
+vp run check:fix
+vp run build
+vp run typecheck
+vp run test
+```
+
+Commit generated changes under `dist/` with the source changes. Include `dist/index.mjs` for GitHub Actions, `dist/gitlab/index.mjs` for GitLab, and `dist/azure/index.mjs` for Azure Pipelines.
+
+The [pre-commit hook](.vite-hooks/pre-commit) runs `vp staged`. The staged-file configuration in [vite.config.ts](vite.config.ts) runs `vp check --fix` on staged files. Run the build yourself; the hook does not rebuild the bundles.
+
+## Integration Design
+
+Use the shared primitives under [`src/ci/`](src/ci/) for portable runtime behavior.
+
+- GitLab: edit the TypeScript runtime under [`src/gitlab/`](src/gitlab/). The template downloads and runs the `vp pack` bundle at `dist/gitlab/index.mjs`. See the [GitLab integration notes](rfcs/gitlab-integration.md) for design constraints and follow-up work.
+- Azure Pipelines: edit the runtime under [`src/azure/`](src/azure/). Azure cannot execute the GitHub Action bundle; the template runs `dist/azure/index.mjs` in `prepare` and `finalize` phases around `Cache@2`. See the [Azure integration notes](rfcs/azure-pipelines-integration.md) for the design, parity table, and cache semantics.
+
+## GitLab End-to-End Tests
+
+Use the dedicated [GitLab test project](https://gitlab.com/fengmk2/setup-vp-gitlab-test) to test the remote integration. GitLab CI has limited capacity, so the [GitLab E2E workflow](.github/workflows/gitlab-e2e.yml) runs only for pull requests approved with the `run-e2e` label or manual `workflow_dispatch` requests. The pipeline loads the template, bootstrap script, and compiled runtime from the exact approved PR commit or the manually selected commit or release tag.
+
+### Request a Run
+
+After reviewing the commit, a maintainer with write access can add `run-e2e` to run the full GitLab suite. This applies to both same-repository and fork PRs. Approve the Actions run if prompted.
+
+For each new commit, review the changes and remove and re-add `run-e2e`. Read the PR result comment for the status and GitLab pipeline link after each run.
+
+Release PRs must pass the full suite on their current head commit before merging. Follow the [release procedure](#releasing) to request and confirm this result.
+
+Pushes, merge queue commits, merges, and release tags do not automatically start GitLab pipelines.
+
+For a manual run, use `workflow_dispatch`. Set `setup_ref` to an exact commit SHA or release tag, or leave it empty to test the selected workflow commit. Select `suite` (`full` by default) and `vite_plus_version` (`latest` by default).
+
+## Dependency Updates
+
+For same-repository PRs with the `needs-bundle-rebuild` label, [the build workflow](.github/workflows/rebuild-bundle.yml) builds the exact PR commit with read-only access. [The publisher](.github/workflows/publish-bundle.yml) runs separately from the default branch and uses a repository-scoped GitHub App token to update only the three bundles in `dist/`. It validates the bundle files before creating the token and does not execute PR code or downloaded bundles. It skips stale PR heads and unchanged bundles; the commit fails if the branch head changes after validation.
+
+The PR's `rebuild-bundle.yml` must match the default branch before the publisher accepts the build. After changes to that workflow reach the default branch, update existing dependency branches and rerun the build. The publisher must be on the default branch to receive build completion events.
+
+Renovate opens a PR when SocketDev publishes a new `sfw-free` release. The custom manager in [`.github/renovate.json`](.github/renovate.json) updates the shared `SFW_VERSION` pin in `src/ci/install-sfw.ts` for all three integrations.
+
+## Releasing
+
+Publish releases as Git tags, not as an npm package. Keep `package.json.version` aligned with the release tag. Consumers pin an exact tag such as `voidzero-dev/setup-vp@v1.21.2` or a commit SHA. Do not move the `v1` major tag, which is frozen at `v1.15.0`.
+
+1. Open a release PR. Set the upcoming version in `package.json`; use it as the source of truth for the release version. Update the release examples in `README.md` and this guide. Set these defaults to `v` followed by that version:
+
+   - The `setup-ref` inputs and inline bootstrap fallbacks in `gitlab/setup-vp.yml` and `gitlab/setup-vp-windows.yml`.
+   - The `setupRef` parameter in `azure/setup-vp.yml`.
+   - The `SETUP_VP_SETUP_REF` fallbacks in `gitlab/bootstrap.sh`, `gitlab/bootstrap.ps1`, `azure/bootstrap.sh`, and `azure/bootstrap.ps1`.
+
+   Run the [required checks](#before-committing) and commit the release changes, including any updated bundles. The bootstrap and template tests compare these defaults with `package.json.version`, so an omitted update fails CI. Do not resolve `latest` at runtime or reuse the frozen `v1` tag.
+
+2. Review the release PR's current head commit, then add the `run-e2e` label to request the full GitLab suite. From the release PR branch:
+
+   ```bash
+   gh pr edit --add-label run-e2e
+   ```
+
+   Follow the [GitLab E2E procedures](#gitlab-end-to-end-tests). After any new commit, including an update from `main`, review the changes and remove and re-add `run-e2e`.
+
+3. Merge the release PR only after GitHub CI and the full GitLab suite pass. Confirm that the latest PR result comment says **GitLab E2E passed**, reports `Suite: full`, and names the current PR head SHA. A successful `GitLab E2E request` workflow only confirms the request; it does not confirm that GitLab tests passed.
+
+   Keep the PR open if verification fails, is cancelled, or has no result for the current head. Fix the failure, including outdated fixtures in the dedicated GitLab test project when needed, then remove and re-add `run-e2e`. Wait for a passing result before merging. Do not defer this check to a manual run after merging or bypass it with an administrator merge.
+
+4. Update `main` and confirm that `HEAD` is the release PR's merge commit. Confirm that all three bundles in `dist/` are in sync. The working tree must stay clean after building:
+
+   ```bash
+   git checkout main
+   git pull --ff-only
+   vp run build
+   git status --short   # must be empty
+   ```
+
+5. Create the new annotated version tag on the release PR's merge commit and push it. For example:
+
+   ```bash
+   git tag -a v1.21.2 -m "v1.21.2"
+   git push origin v1.21.2
+   ```

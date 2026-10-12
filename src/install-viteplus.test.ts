@@ -1,18 +1,28 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test";
 import { exec } from "@actions/exec";
-import { warning } from "@actions/core";
+import { addPath, exportVariable, warning } from "@actions/core";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import { installVitePlus } from "./install-viteplus.js";
+import { findReusableVitePlus } from "./reuse-viteplus.js";
 import type { Inputs } from "./types.js";
+
+const windows = process.platform === "win32";
+const installerExtension = windows ? "ps1" : "sh";
 
 vi.mock("@actions/core", () => ({
   info: vi.fn(),
   warning: vi.fn(),
   addPath: vi.fn(),
+  exportVariable: vi.fn(),
 }));
 
 vi.mock("@actions/exec", () => ({
   exec: vi.fn(),
 }));
+
+vi.mock("./reuse-viteplus.js", () => ({ findReusableVitePlus: vi.fn() }));
 
 vi.mock("node:timers/promises", () => ({
   setTimeout: vi.fn().mockResolvedValue(undefined),
@@ -26,11 +36,36 @@ const baseInputs: Inputs = {
   runInstall: [],
   sfw: false,
   cache: false,
+  cacheSave: true,
   cacheDependencyPath: undefined,
   taskCache: false,
   registryUrl: undefined,
   scope: undefined,
 };
+
+const commitSha = "7d848b3da1987fa60b4cf18487fcc36a2a697e94";
+
+function writeDirsFile(options: unknown, bin: string, data = "/test/data"): void {
+  const dirsFile = (options as { env: Record<string, string> }).env.SETUP_VP_DIRS_FILE;
+  writeFileSync(
+    dirsFile,
+    [
+      `data\t${data}`,
+      `bin\t${bin}`,
+      "cache\t/test/cache",
+      "config\t/test/config",
+      "state\t/test/state",
+    ].join("\n"),
+  );
+}
+
+function mockSuccessfulInstallOnce(): void {
+  vi.mocked(exec).mockImplementationOnce(async (_command, _args, options) => {
+    const env = (options as { env: Record<string, string> }).env;
+    if (env.SETUP_VP_DIRS_FILE) writeDirsFile(options, "/test/data/bin");
+    return 0;
+  });
+}
 
 describe("installVitePlus", () => {
   // installVitePlus spreads process.env into the child env, so a VP_PR_VERSION
@@ -39,6 +74,8 @@ describe("installVitePlus", () => {
   beforeEach(() => {
     vi.stubEnv("VP_PR_VERSION", undefined);
     vi.stubEnv("VP_NODE_MANAGER", undefined);
+    vi.stubEnv("VP_VPDIRS_AWARE", undefined);
+    vi.stubEnv("SETUP_VP_DIRS_FILE", undefined);
   });
 
   afterEach(() => {
@@ -47,16 +84,127 @@ describe("installVitePlus", () => {
   });
 
   it("should succeed on first attempt without retrying", async () => {
-    vi.mocked(exec).mockResolvedValueOnce(0);
+    vi.mocked(exec).mockImplementationOnce(async (_command, _args, options) => {
+      writeDirsFile(options, "/test/data/bin");
+      return 0;
+    });
 
     await installVitePlus(baseInputs);
 
     expect(exec).toHaveBeenCalledTimes(1);
     expect(warning).not.toHaveBeenCalled();
+    expect(addPath).toHaveBeenCalledWith("/test/data/bin");
+  });
+
+  it("reuses a validated installation and puts it first on PATH", async () => {
+    vi.stubEnv("PATH", "/other/bin:/existing/bin");
+    vi.mocked(findReusableVitePlus).mockReturnValue({ bin: "/existing/bin" });
+
+    await installVitePlus({ ...baseInputs, version: "0.3.0", nodeManager: true });
+
+    expect(findReusableVitePlus).toHaveBeenCalledWith("0.3.0");
+    expect(addPath).toHaveBeenCalledWith("/existing/bin");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each(["fresh", "reused"])(
+    "exports fallback shims after system tools for a %s installation",
+    async (installation) => {
+      const root = mkdtempSync(join(tmpdir(), "setup-vp-path-"));
+      const bin = join(root, "separate-bin");
+      const data = join(root, "data");
+      const fallbackBin = join(data, "fallback-bin");
+      mkdirSync(fallbackBin, { recursive: true });
+      const githubPath = join(root, "github-path");
+      const githubEnv = join(root, "github-env");
+      writeFileSync(githubPath, "");
+      writeFileSync(githubEnv, "");
+      vi.stubEnv("GITHUB_PATH", githubPath);
+      vi.stubEnv("GITHUB_ENV", githubEnv);
+      vi.stubEnv("PATH", [fallbackBin, "/system/bin", fallbackBin].join(delimiter));
+      const core = await vi.importActual<typeof import("@actions/core")>("@actions/core");
+      vi.mocked(addPath).mockImplementation(core.addPath);
+      vi.mocked(exportVariable).mockImplementation(core.exportVariable);
+      if (installation === "reused") {
+        vi.mocked(findReusableVitePlus).mockReturnValue({ bin, fallbackBin });
+      } else {
+        vi.mocked(exec).mockImplementationOnce(async (_command, _args, options) => {
+          writeDirsFile(options, bin, data);
+          return 0;
+        });
+      }
+
+      try {
+        await installVitePlus(baseInputs);
+
+        const expectedPath = [bin, "/system/bin", fallbackBin].join(delimiter);
+        expect(process.env.PATH).toBe(expectedPath);
+        expect(exportVariable).toHaveBeenCalledWith("PATH", expectedPath);
+        expect(readFileSync(githubEnv, "utf8")).toContain(expectedPath);
+        expect(readFileSync(githubPath, "utf8").trim()).toBe(bin);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("should fall back to the legacy bin for Vite+ releases without VpDirs", async () => {
+    vi.stubEnv("HOME", "/home/runner");
+    vi.stubEnv("USERPROFILE", "/home/runner");
+    vi.stubEnv("PATH", "/usr/bin");
+    vi.stubEnv("VP_VPDIRS_AWARE", "1");
+    vi.stubEnv("SETUP_VP_DIRS_FILE", "/tmp/stale-vp-dirs");
+    mockSuccessfulInstallOnce();
+
+    await installVitePlus({ ...baseInputs, version: "0.2.9" });
+
+    expect(addPath).toHaveBeenCalledWith(join("/home/runner", ".vite-plus", "bin"));
+    const [_command, args, options] = vi.mocked(exec).mock.calls[0];
+    expect((args as string[])[1]).toContain(windows ? "[scriptblock]::Create" : "| bash");
+    expect((args as string[])[1]).not.toContain("VP_DUMP_DIRS");
+    expect((options as { env: Record<string, string> }).env.VP_VPDIRS_AWARE).toBeUndefined();
+    expect((options as { env: Record<string, string> }).env.SETUP_VP_DIRS_FILE).toBeUndefined();
+  });
+
+  it("should use the installed version to resolve the latest dist-tag", async () => {
+    vi.stubEnv("HOME", "/home/runner");
+    vi.stubEnv("USERPROFILE", "/home/runner");
+    vi.stubEnv("PATH", "/usr/bin");
+    vi.mocked(exec).mockImplementationOnce(async (_command, _args, options) => {
+      const env = (options as { env: Record<string, string> }).env;
+      writeFileSync(env.SETUP_VP_DIRS_FILE, "vp v0.2.9\n");
+      return 0;
+    });
+
+    await installVitePlus(baseInputs);
+
+    expect(addPath).toHaveBeenCalledWith(join("/home/runner", ".vite-plus", "bin"));
+  });
+
+  it.each([
+    { version: "0.3.0", output: "vp v0.2.9\n" },
+    { version: `0.0.0-commit.${commitSha}`, output: "bin\t/test/data/bin\n" },
+    { version: "latest", output: "vp v0.3.0\n" },
+  ])("should fail when $version does not report valid VpDirs", async ({ version, output }) => {
+    vi.mocked(exec).mockImplementationOnce(async (_command, _args, options) => {
+      if (output !== undefined) {
+        const env = (options as { env: Record<string, string> }).env;
+        writeFileSync(env.SETUP_VP_DIRS_FILE, output);
+      }
+      return 0;
+    });
+
+    await expect(installVitePlus({ ...baseInputs, version })).rejects.toThrow(
+      "Vite+ was installed successfully, but setup-vp could not resolve its VpDirs.",
+    );
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(addPath).not.toHaveBeenCalled();
   });
 
   it("should retry on transient failure and eventually succeed", async () => {
-    vi.mocked(exec).mockResolvedValueOnce(6).mockResolvedValueOnce(6).mockResolvedValueOnce(0);
+    vi.mocked(exec).mockResolvedValueOnce(6).mockResolvedValueOnce(6);
+    mockSuccessfulInstallOnce();
 
     await installVitePlus(baseInputs);
 
@@ -73,7 +221,8 @@ describe("installVitePlus", () => {
   });
 
   it("should retry when exec itself throws (e.g. process spawn error)", async () => {
-    vi.mocked(exec).mockRejectedValueOnce(new Error("spawn bash ENOENT")).mockResolvedValueOnce(0);
+    vi.mocked(exec).mockRejectedValueOnce(new Error("spawn bash ENOENT"));
+    mockSuccessfulInstallOnce();
 
     await installVitePlus(baseInputs);
 
@@ -82,18 +231,19 @@ describe("installVitePlus", () => {
   });
 
   it("should fall back to the GitHub install URL after a single primary failure", async () => {
-    vi.mocked(exec).mockResolvedValueOnce(35).mockResolvedValueOnce(0);
+    vi.mocked(exec).mockResolvedValueOnce(35);
+    mockSuccessfulInstallOnce();
 
     await installVitePlus(baseInputs);
 
     expect(exec).toHaveBeenCalledTimes(2);
 
     const primaryScript = (vi.mocked(exec).mock.calls[0][1] as string[])[1];
-    expect(primaryScript).toContain("https://viteplus.dev/install.sh");
+    expect(primaryScript).toContain(`https://viteplus.dev/install.${installerExtension}`);
 
     const fallbackScript = (vi.mocked(exec).mock.calls[1][1] as string[])[1];
     expect(fallbackScript).toContain(
-      "https://raw.githubusercontent.com/voidzero-dev/vite-plus/main/packages/cli/install.sh",
+      `https://raw.githubusercontent.com/voidzero-dev/vite-plus/main/packages/cli/install.${installerExtension}`,
     );
   });
 
@@ -104,27 +254,114 @@ describe("installVitePlus", () => {
 
     const scripts = vi.mocked(exec).mock.calls.map((call) => (call[1] as string[])[1]);
     expect(scripts).toHaveLength(4);
-    expect(scripts[0]).toContain("viteplus.dev/install.sh");
+    expect(scripts[0]).toContain(`viteplus.dev/install.${installerExtension}`);
     expect(scripts[1]).toContain("raw.githubusercontent.com");
-    expect(scripts[2]).toContain("viteplus.dev/install.sh");
+    expect(scripts[2]).toContain(`viteplus.dev/install.${installerExtension}`);
     expect(scripts[3]).toContain("raw.githubusercontent.com");
   });
 
-  it("should run the bash install with pipefail and timeout flags so transient failures fail fast", async () => {
-    vi.mocked(exec).mockResolvedValueOnce(0);
+  // ci/install-script-urls.test.ts tests the exact URL strings. These tests
+  // verify that the version reaches the URL selection.
+  it.each([
+    { desc: "exact versions", version: "0.2.9", ref: "v0.2.9" },
+    { desc: "pkg.pr.new commit builds", version: `0.0.0-commit.${commitSha}`, ref: commitSha },
+  ])(
+    "should install $desc with the install script from their git ref",
+    async ({ version, ref }) => {
+      mockSuccessfulInstallOnce();
+
+      await installVitePlus({ ...baseInputs, version });
+
+      const script = (vi.mocked(exec).mock.calls[0][1] as string[])[1];
+      expect(script).toContain(
+        `https://raw.githubusercontent.com/voidzero-dev/vite-plus/${ref}/packages/cli/install.${installerExtension}`,
+      );
+    },
+  );
+
+  it("should fall back to the jsDelivr mirror of the pinned script on failure", async () => {
+    vi.mocked(exec).mockResolvedValueOnce(35);
+    mockSuccessfulInstallOnce();
+
+    await installVitePlus({ ...baseInputs, version: "0.2.9" });
+
+    const fallbackScript = (vi.mocked(exec).mock.calls[1][1] as string[])[1];
+    expect(fallbackScript).toContain(
+      `https://cdn.jsdelivr.net/gh/voidzero-dev/vite-plus@v0.2.9/packages/cli/install.${installerExtension}`,
+    );
+    // If both pinned attempts fail, the code warns before it uses the latest
+    // URLs. Success on the mirror must not trigger the compatibility fallback.
+    expect(warning).not.toHaveBeenCalledWith(expect.stringContaining("latest install script"));
+  });
+
+  it("should fall back to the latest install script only after exhausting pinned URLs", async () => {
+    // 4 pinned attempts fail (2 rounds × 2 URLs), the 5th (latest CDN) succeeds.
+    vi.mocked(exec)
+      .mockResolvedValueOnce(22)
+      .mockResolvedValueOnce(22)
+      .mockResolvedValueOnce(22)
+      .mockResolvedValueOnce(22);
+    mockSuccessfulInstallOnce();
+
+    await installVitePlus({ ...baseInputs, version: "0.2.9" });
+
+    const scripts = vi.mocked(exec).mock.calls.map((call) => (call[1] as string[])[1]);
+    expect(scripts[0]).toContain("/v0.2.9/");
+    expect(scripts[1]).toContain("jsdelivr");
+    expect(scripts[2]).toContain("/v0.2.9/");
+    expect(scripts[3]).toContain("jsdelivr");
+    expect(scripts[4]).toContain(`https://viteplus.dev/install.${installerExtension}`);
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("The latest script may not be compatible with 0.2.9"),
+    );
+  });
+
+  it("should count pinned and latest URLs in the exhaustion error for exact versions", async () => {
+    vi.mocked(exec).mockResolvedValue(6);
+
+    await expect(installVitePlus({ ...baseInputs, version: "0.2.9" })).rejects.toThrow(
+      /after 8 attempts across 4 URL\(s\)/,
+    );
+    // 2 rounds × 2 pinned URLs + 2 rounds × 2 latest URLs.
+    expect(exec).toHaveBeenCalledTimes(8);
+  });
+
+  it("should source the platform installer and dump its resolved directories", async () => {
+    mockSuccessfulInstallOnce();
 
     await installVitePlus(baseInputs);
 
     const [cmd, args] = vi.mocked(exec).mock.calls[0];
-    expect(cmd).toBe("bash");
+    expect(cmd).toBe(windows ? "pwsh" : "bash");
     const script = (args as string[])[1];
-    expect(script).toMatch(/^set -o pipefail;/);
+    if (windows) {
+      expect(script).toContain(". ([scriptblock]::Create((irm -TimeoutSec");
+      expect(script).toContain("Join-Path $vpDir 'vp.exe'");
+      expect(script).toContain("& $vpPath --version");
+      expect(script).toContain("$env:VP_DUMP_DIRS = '1'");
+      expect(script).toContain("& $vpPath | Add-Content -LiteralPath $dirsFile");
+      return;
+    }
+    expect(script).toMatch(/^set \+u\nset -eo pipefail\n/);
     expect(script).toContain("--connect-timeout");
     expect(script).toContain("--max-time");
-    expect(script).toMatch(/\| bash$/);
+    expect(script).toContain('-o "$installer_file"');
+    expect(script).toContain('source "$installer_file"');
+    expect(script).not.toContain("source /dev/stdin");
+    expect(script).toContain('"$vp_dir/vp" --version');
+    expect(script).toContain('VP_DUMP_DIRS=1 "$vp_dir/vp"');
   });
 
-  const commitSha = "7d848b3da1987fa60b4cf18487fcc36a2a697e94";
+  it("should declare VpDirs support to the installer", async () => {
+    mockSuccessfulInstallOnce();
+
+    await installVitePlus(baseInputs);
+
+    const options = vi.mocked(exec).mock.calls[0][2] as { env: Record<string, string> };
+    expect(options.env.VP_VPDIRS_AWARE).toBe("1");
+    expect(options.env.SETUP_VP_DIRS_FILE).toMatch(/setup-vp-dirs-.*\.txt$/);
+  });
+
   it.each([
     {
       desc: "should route pkg.pr.new commit builds through VP_PR_VERSION",
@@ -143,7 +380,7 @@ describe("installVitePlus", () => {
       expected: undefined,
     },
   ])("$desc", async ({ version, expected }) => {
-    vi.mocked(exec).mockResolvedValueOnce(0);
+    mockSuccessfulInstallOnce();
 
     await installVitePlus({ ...baseInputs, version });
 
@@ -151,28 +388,15 @@ describe("installVitePlus", () => {
     expect(options.env.VP_PR_VERSION).toBe(expected);
   });
 
-  it.each([
-    {
-      desc: "should pass VP_NODE_MANAGER=no when node-manager is false",
-      nodeManager: false,
-      expected: "no",
-    },
-    {
-      desc: "should pass VP_NODE_MANAGER=yes when node-manager is true",
-      nodeManager: true,
-      expected: "yes",
-    },
-    {
-      desc: "should leave VP_NODE_MANAGER unset when node-manager is not specified",
-      nodeManager: undefined,
-      expected: undefined,
-    },
-  ])("$desc", async ({ nodeManager, expected }) => {
-    vi.mocked(exec).mockResolvedValueOnce(0);
+  it.each([true, false, undefined])(
+    "leaves installer management unchanged for node-manager %s",
+    async (nodeManager) => {
+      mockSuccessfulInstallOnce();
 
-    await installVitePlus({ ...baseInputs, nodeManager });
+      await installVitePlus({ ...baseInputs, nodeManager });
 
-    const options = vi.mocked(exec).mock.calls[0][2] as { env: { [key: string]: string } };
-    expect(options.env.VP_NODE_MANAGER).toBe(expected);
-  });
+      const options = vi.mocked(exec).mock.calls[0][2] as { env: { [key: string]: string } };
+      expect(options.env.VP_NODE_MANAGER).toBeUndefined();
+    },
+  );
 });

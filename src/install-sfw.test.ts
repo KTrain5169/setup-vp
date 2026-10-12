@@ -4,8 +4,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vite-plus/test"
 // in-file references resolve to the mocked versions. setupSfw / installSfw
 // call findSfwOnPath / isSfwSupported / installSfw directly within the
 // module, so we drive them by stubbing process.platform and the external
-// shells (@actions/core, @actions/cache, @actions/exec, node:child_process,
-// node:fs).
+// dependencies (@actions/core, @actions/cache, @actions/exec,
+// commandPath, node:fs).
 vi.mock("@actions/core", () => ({
   info: vi.fn(),
   warning: vi.fn(),
@@ -18,10 +18,9 @@ vi.mock("@actions/cache", () => ({
 vi.mock("@actions/exec", () => ({
   exec: vi.fn(),
 }));
-vi.mock("node:child_process", () => ({
-  execFileSync: vi.fn(),
-}));
-vi.mock("node:fs", () => ({
+vi.mock("./ci/process.js", () => ({ commandPath: vi.fn() }));
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:fs")>()),
   chmodSync: vi.fn(),
   existsSync: vi.fn(),
   mkdirSync: vi.fn(),
@@ -33,8 +32,9 @@ vi.mock("node:timers/promises", () => ({
 import { restoreCache, saveCache } from "@actions/cache";
 import { addPath, info, warning } from "@actions/core";
 import { exec } from "@actions/exec";
-import { execFileSync } from "node:child_process";
+import { commandPath } from "./ci/process.js";
 import { existsSync } from "node:fs";
+import { SFW_VERSION } from "./ci/install-sfw.js";
 import { getSfwAssetName, installSfw, isSfwSupported, setupSfw } from "./install-sfw.js";
 import type { Inputs } from "./types.js";
 
@@ -143,6 +143,7 @@ function makeInputs(overrides: Partial<Inputs> = {}): Inputs {
     runInstall: [{}],
     sfw: true,
     cache: false,
+    cacheSave: true,
     cacheDependencyPath: undefined,
     taskCache: false,
     registryUrl: undefined,
@@ -152,6 +153,8 @@ function makeInputs(overrides: Partial<Inputs> = {}): Inputs {
 }
 
 describe("setupSfw", () => {
+  const previewVersion = "0.0.0-commit.7d848b3da1987fa60b4cf18487fcc36a2a697e94";
+
   beforeEach(() => {
     vi.resetAllMocks();
     stubPlatform("linux", "x64");
@@ -166,43 +169,83 @@ describe("setupSfw", () => {
     Object.defineProperty(process, "arch", { value: originalArch, configurable: true });
   });
 
-  it("returns false silently when inputs.sfw is false", async () => {
-    expect(await setupSfw(makeInputs({ sfw: false }))).toBe(false);
+  it("selects plain vp silently when inputs.sfw is false", async () => {
+    expect(await setupSfw(makeInputs({ sfw: false }))).toEqual({ executable: "vp", sfw: false });
     expect(info).not.toHaveBeenCalled();
     expect(warning).not.toHaveBeenCalled();
   });
 
-  it("returns false with an info log when run-install is empty", async () => {
-    expect(await setupSfw(makeInputs({ runInstall: [] }))).toBe(false);
+  it.each(["linux", "darwin", "win32"] as const)(
+    "disables sfw for preview builds on %s even when sfw is on PATH",
+    async (platform) => {
+      stubPlatform(platform, "x64");
+      vi.mocked(commandPath).mockReturnValue("/usr/bin/sfw");
+
+      expect(await setupSfw(makeInputs({ version: previewVersion }))).toEqual({
+        executable: "vp",
+        sfw: false,
+      });
+
+      expect(warning).toHaveBeenCalledExactlyOnceWith(
+        `sfw was requested but is automatically disabled for Vite+ preview build ${previewVersion}; Socket Firewall Free will not be used.`,
+      );
+      expect(commandPath).not.toHaveBeenCalled();
+      expect(restoreCache).not.toHaveBeenCalled();
+      expect(exec).not.toHaveBeenCalled();
+      expect(addPath).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not warn about preview builds when sfw is already disabled", async () => {
+    expect(await setupSfw(makeInputs({ sfw: false, version: previewVersion }))).toEqual({
+      executable: "vp",
+      sfw: false,
+    });
+    expect(warning).not.toHaveBeenCalled();
+  });
+
+  it.each(["0.3.2", "0.3.3-alpha.1", "latest", "next"])(
+    "keeps sfw enabled for %s",
+    async (version) => {
+      vi.mocked(commandPath).mockReturnValue("/usr/bin/sfw");
+      expect(await setupSfw(makeInputs({ version }))).toEqual({
+        executable: "/usr/bin/sfw",
+        sfw: true,
+      });
+      expect(warning).not.toHaveBeenCalled();
+    },
+  );
+
+  it("selects plain vp with an info log when run-install is empty", async () => {
+    expect(await setupSfw(makeInputs({ runInstall: [] }))).toEqual({
+      executable: "vp",
+      sfw: false,
+    });
     expect(info).toHaveBeenCalledWith(expect.stringContaining("`run-install` is disabled"));
     expect(warning).not.toHaveBeenCalled();
   });
 
-  it("uses an existing sfw on PATH on macOS and skips the download", async () => {
-    // macOS is supported as of vp v0.1.23 — the PATH-detection branch now
-    // applies to all platforms, not just Linux.
-    stubPlatform("darwin", "arm64");
-    vi.mocked(execFileSync).mockReturnValue("/usr/local/bin/sfw\n");
-    expect(await setupSfw(makeInputs())).toBe(true);
-    expect(info).toHaveBeenCalledWith(expect.stringContaining("Using existing sfw on PATH"));
-    expect(restoreCache).not.toHaveBeenCalled(); // installSfw never invoked
-    expect(exec).not.toHaveBeenCalled();
-  });
+  it.each([
+    ["darwin", "arm64", "/usr/local/bin/sfw"],
+    ["linux", "x64", "/usr/bin/sfw"],
+  ] as const)(
+    "uses an existing sfw on PATH on %s and skips the download",
+    async (platform, arch, executable) => {
+      stubPlatform(platform, arch);
+      vi.mocked(commandPath).mockReturnValue(executable);
 
-  it("uses an existing sfw on PATH on Linux and skips the download", async () => {
-    vi.mocked(execFileSync).mockReturnValue("/usr/bin/sfw\n");
-    expect(await setupSfw(makeInputs())).toBe(true);
-    expect(info).toHaveBeenCalledWith(expect.stringContaining("Using existing sfw on PATH"));
-    expect(restoreCache).not.toHaveBeenCalled();
-    expect(exec).not.toHaveBeenCalled();
-  });
+      expect(await setupSfw(makeInputs())).toEqual({ executable, sfw: true });
+      expect(info).toHaveBeenCalledWith(expect.stringContaining("Using existing sfw on PATH"));
+      expect(commandPath).toHaveBeenCalledExactlyOnceWith("sfw");
+      expect(restoreCache).not.toHaveBeenCalled();
+      expect(exec).not.toHaveBeenCalled();
+    },
+  );
 
   it("falls back with a warning on an unsupported arch + no sfw on PATH", async () => {
     stubPlatform("linux", "ia32");
-    vi.mocked(execFileSync).mockImplementation(() => {
-      throw new Error("not found");
-    });
-    expect(await setupSfw(makeInputs())).toBe(false);
+    vi.mocked(commandPath).mockReturnValue(undefined);
+    expect(await setupSfw(makeInputs())).toEqual({ executable: "vp", sfw: false });
     expect(warning).toHaveBeenCalledWith(
       expect.stringContaining("no published binary for this runner"),
     );
@@ -214,6 +257,9 @@ describe("installSfw", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     stubPlatform("linux", "x64");
+    vi.spyOn(process.report, "getReport").mockReturnValue({
+      header: { glibcVersionRuntime: "2.39" },
+    });
     // existsSync needs nuance: /etc/alpine-release → false (glibc), and
     // the downloaded binary path → true (so we proceed to chmod + addPath).
     vi.mocked(existsSync).mockImplementation((path) => {
@@ -224,12 +270,13 @@ describe("installSfw", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
     Object.defineProperty(process, "arch", { value: originalArch, configurable: true });
   });
 
   it("uses the cached binary and skips download on a cache hit", async () => {
-    vi.mocked(restoreCache).mockResolvedValueOnce("sfw-v1.11.0-linux-x64-glibc");
+    vi.mocked(restoreCache).mockResolvedValueOnce(`sfw-${SFW_VERSION}-linux-x64-glibc`);
     await installSfw();
     expect(exec).not.toHaveBeenCalled(); // no download attempted
     expect(saveCache).not.toHaveBeenCalled(); // no re-save on hit
@@ -237,15 +284,38 @@ describe("installSfw", () => {
     expect(info).toHaveBeenCalledWith(expect.stringContaining("restored from cache"));
   });
 
-  it("downloads and writes to cache on a cache miss", async () => {
-    vi.mocked(restoreCache).mockResolvedValueOnce(undefined);
-    vi.mocked(exec).mockResolvedValueOnce(0); // download success
-    vi.mocked(saveCache).mockResolvedValueOnce(123);
-    await installSfw();
-    expect(exec).toHaveBeenCalledTimes(1);
-    expect(saveCache).toHaveBeenCalledTimes(1);
-    expect(info).toHaveBeenCalledWith(expect.stringContaining("sfw cached under key"));
-  });
+  it.each([
+    ["linux", "x64", false, "sfw-free-linux-x86_64", "bash", "-c"],
+    ["linux", "arm64", true, "sfw-free-musl-linux-arm64", "bash", "-c"],
+    ["darwin", "arm64", false, "sfw-free-macos-arm64", "bash", "-c"],
+    ["win32", "x64", false, "sfw-free-windows-x86_64.exe", "pwsh", "-Command"],
+  ] as const)(
+    "downloads and caches the shared SFW version on %s/%s (musl=%s)",
+    async (platform, arch, isMusl, asset, shell, commandFlag) => {
+      stubPlatform(platform, arch);
+      if (isMusl) vi.spyOn(process.report, "getReport").mockReturnValue({ header: {} });
+      vi.mocked(restoreCache).mockResolvedValueOnce(undefined);
+      vi.mocked(exec).mockResolvedValueOnce(0);
+      vi.mocked(saveCache).mockResolvedValueOnce(123);
+
+      await installSfw();
+
+      const cacheKey = `sfw-${SFW_VERSION}-${platform}-${arch}-${isMusl ? "musl" : "glibc"}`;
+      expect(restoreCache).toHaveBeenCalledExactlyOnceWith([expect.any(String)], cacheKey);
+      expect(exec).toHaveBeenCalledExactlyOnceWith(
+        shell,
+        [
+          commandFlag,
+          expect.stringContaining(
+            `https://github.com/SocketDev/sfw-free/releases/download/${SFW_VERSION}/${asset}`,
+          ),
+        ],
+        { ignoreReturnCode: true },
+      );
+      expect(saveCache).toHaveBeenCalledExactlyOnceWith([expect.any(String)], cacheKey);
+      expect(info).toHaveBeenCalledWith(expect.stringContaining("sfw cached under key"));
+    },
+  );
 
   it("falls through to download when cache restore throws", async () => {
     vi.mocked(restoreCache).mockRejectedValueOnce(new Error("cache service down"));
@@ -259,7 +329,7 @@ describe("installSfw", () => {
     vi.mocked(restoreCache).mockResolvedValueOnce(undefined);
     vi.mocked(exec).mockResolvedValueOnce(0);
     vi.mocked(saveCache).mockRejectedValueOnce(new Error("ReserveCacheError"));
-    await expect(installSfw()).resolves.toBeUndefined();
+    await expect(installSfw()).resolves.toEqual(expect.stringMatching(/[\\/]sfw-bin[\\/]sfw$/));
     expect(warning).toHaveBeenCalledWith(expect.stringContaining("cache save failed"));
   });
 });

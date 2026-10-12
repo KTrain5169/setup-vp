@@ -1,3 +1,4 @@
+import type { PackageManagerConfig } from "./ci/package-manager.js";
 import { z } from "zod/mini";
 
 // Run install configuration schema
@@ -23,29 +24,20 @@ export interface Inputs {
   readonly nodeVersion?: string;
   readonly nodeVersionFile?: string;
   readonly nodeManager?: boolean;
+  readonly packageManager?: PackageManagerConfig;
   readonly workingDirectory?: string;
   readonly runInstall: RunInstall[];
   readonly sfw: boolean;
   readonly cache: boolean;
+  readonly cacheSave: boolean;
   readonly cacheDependencyPath?: string;
   readonly taskCache: boolean;
   readonly registryUrl?: string;
   readonly scope?: string;
 }
 
-// Lock file types
-export enum LockFileType {
-  Npm = "npm",
-  Pnpm = "pnpm",
-  Yarn = "yarn",
-  Bun = "bun",
-}
-
-export interface LockFileInfo {
-  type: LockFileType;
-  path: string;
-  filename: string;
-}
+export { LockFileType } from "./ci/types.js";
+export type { LockFileInfo } from "./ci/types.js";
 
 // State keys for main/post communication
 export enum State {

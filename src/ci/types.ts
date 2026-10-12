@@ -3,11 +3,17 @@ export type RunInstallEntry = {
   args?: string[];
 };
 
+export const DISPLAY_NAME = "Vite+";
+export const PACKAGE_NAME = "vite-plus";
+
 export type RunInstallInput = null | boolean | RunInstallEntry | RunInstallEntry[];
 
 export type RuntimeEnv = Record<string, string | undefined>;
 
-export type InstallCommand = "vp" | "sfw";
+export type InstallCommand = {
+  executable: string;
+  sfw: boolean;
+};
 
 export enum LockFileType {
   Npm = "npm",

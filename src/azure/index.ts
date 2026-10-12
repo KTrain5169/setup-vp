@@ -1,8 +1,16 @@
+import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { configureAuth } from "../ci/auth.js";
+import { packageManagerArgs } from "../ci/package-manager.js";
+import { createVersionResolver } from "../ci/version-file.js";
+import { createNodeVersionResolver } from "../ci/node-version-file.js";
+import { resolutionContext } from "../ci/resolution.js";
+import { nodeManagerOffArgs } from "../ci/node-manager.js";
+import { pkgPrNewCommitSha } from "../ci/install-script-urls.js";
+import { configureAuth, isReservedAuthVariable } from "../ci/auth.js";
+import { analyzeProjectNpmrc, readNpmrc } from "../ci/npmrc.js";
 import { prepareCacheMetadata } from "../ci/cache.js";
-import { setupSfw } from "../ci/install-sfw.js";
+import { getSfwAssetName, isMuslLinux, setupSfw, SFW_VERSION } from "../ci/install-sfw.js";
 import { getCommandOutput, run } from "../ci/process.js";
 import { parseRunInstall, runInstall } from "../ci/run-install.js";
 import { parseInstalledVpVersion } from "../ci/version.js";
@@ -18,7 +26,7 @@ export interface AzurePorts {
   configureAuth: typeof configureAuth;
   setupSfw: typeof setupSfw;
   parseRunInstall: typeof parseRunInstall;
-  runInstall: typeof runInstall;
+  runInstall: (...args: Parameters<typeof runInstall>) => void | Promise<void>;
   getCommandOutput: typeof getCommandOutput;
   run: typeof run;
   parseInstalledVpVersion: typeof parseInstalledVpVersion;
@@ -56,25 +64,75 @@ export async function runPrepare(
   const inputs = parseAzureInputs(env);
   const projectDir = resolveProjectDirFromInputs(inputs);
 
+  if (inputs.nodeManager === false && (inputs.nodeVersion || inputs.nodeVersionFile)) {
+    throw new Error("node-version and node-version-file cannot be used with node-manager: false");
+  }
+  const context = {
+    ...resolutionContext(inputs.workspaceRoot),
+    info: ports.logInfo,
+    warning: ports.logWarning,
+  };
+  const version = createVersionResolver(context).resolveVitePlusVersion(inputs, projectDir);
+  const nodeVersion =
+    inputs.nodeVersion ||
+    (inputs.nodeVersionFile
+      ? createNodeVersionResolver(context).resolveNodeVersionFile(
+          inputs.nodeVersionFile,
+          projectDir,
+        )
+      : undefined);
+
   ports.setVariable("SETUP_VP_CACHE_HIT", "false");
   ports.setVariable("SETUP_VP_CACHE_READY", "false");
+  ports.setVariable("SETUP_VP_SFW_READY", "false");
+  // Keep the setup runtime independent of the project's selected Node version.
+  ports.setVariable("SETUP_VP_BOOTSTRAP_NODE", process.execPath);
 
-  await ports.installVitePlus(inputs.version, {
+  await ports.installVitePlus(version, {
     env,
-    nodeManager: inputs.nodeManager,
     prependPath: (binDir) => ports.prependPath(binDir),
+    exportPath: (value) => ports.setVariable("PATH", value),
     logWarningFn: ports.logWarning,
   });
+  // Finalize must use the resolved version, including pins from files or lockfiles.
+  ports.setVariable("SETUP_VP_RESOLVED_VERSION", version);
 
-  // VP_NODE_MANAGER=no at install time only skips shim creation; vp commands
-  // would still resolve their internal JS runtime to managed Node, so also
-  // flip the config to system-first (e.g. the Node.js from UseNode@1).
+  const versionOutput =
+    inputs.nodeManager === false || inputs.packageManager !== undefined
+      ? ports.getCommandOutput("vp", ["--version"]) || ""
+      : "";
+  const packageManagerCommands = packageManagerArgs(inputs.packageManager, versionOutput);
+
+  // Switch to the agent's Node.js after installation, preserving package-manager management.
   if (inputs.nodeManager === false) {
-    ports.run("vp", ["env", "off"]);
+    ports.run("vp", nodeManagerOffArgs(versionOutput));
+  } else if (nodeVersion) {
+    ports.run("vp", ["env", "use", nodeVersion], { cwd: projectDir });
+  }
+
+  for (const args of packageManagerCommands) {
+    ports.run("vp", args);
   }
 
   const runtimePath = path.resolve(process.argv[1] || "");
   ports.setVariable("SETUP_VP_RUNTIME_PATH", runtimePath);
+
+  if (
+    inputs.sfw &&
+    !pkgPrNewCommitSha(version) &&
+    ports.parseRunInstall(inputs.runInstall).length > 0
+  ) {
+    try {
+      const asset = getSfwAssetName(process.platform, process.arch, isMuslLinux());
+      const sfwCache = path.join(env.PIPELINE_WORKSPACE || inputs.workspaceRoot, ".setup-vp-sfw");
+      mkdirSync(sfwCache, { recursive: true });
+      ports.setVariable("SETUP_VP_SFW_CACHE_DIR", sfwCache);
+      ports.setVariable("SETUP_VP_SFW_CACHE_KEY", `${SFW_VERSION}-${asset}`);
+      ports.setVariable("SETUP_VP_SFW_READY", "true");
+    } catch (error) {
+      ports.logWarning(String(error));
+    }
+  }
 
   if (!inputs.cache) return;
 
@@ -107,28 +165,54 @@ export async function runFinalize(
 ): Promise<void> {
   const inputs = parseAzureInputs(env);
   const projectDir = resolveProjectDirFromInputs(inputs);
+  // Azure leaves undefined macros unexpanded, including aliases supplied via
+  // authEnv. Normalize only credentials, not unrelated task environment values.
+  const npmrc = readNpmrc(path.join(projectDir, ".npmrc"));
+  const authVariables = analyzeProjectNpmrc(npmrc).envVarRefs;
+  authVariables.add("NODE_AUTH_TOKEN");
+  for (const name of authVariables) {
+    if (!isReservedAuthVariable(name) && /^\$\([^)]+\)$/.test(env[name] || "")) delete env[name];
+  }
 
-  ports.configureAuth(inputs.registryUrl, inputs.scope, env, (name, value) => {
-    if (name === "NODE_AUTH_TOKEN") return;
-    if (value !== undefined) ports.setVariable(name, value);
-  });
+  ports.configureAuth(
+    inputs.registryUrl,
+    inputs.scope,
+    env,
+    (name, value) => {
+      if (name === "NODE_AUTH_TOKEN" || value === undefined) return;
+      ports.setVariable(name, value, {
+        isSecret: name !== "NPM_CONFIG_USERCONFIG" && name !== "PNPM_CONFIG_USERCONFIG",
+      });
+    },
+    projectDir,
+  );
 
   const runInstallEntries = ports.parseRunInstall(inputs.runInstall);
   const installCommand = await ports.setupSfw(runInstallEntries, {
     env,
     sfwEnabled: inputs.sfw,
+    vitePlusVersion: env.SETUP_VP_RESOLVED_VERSION || inputs.version,
+    logWarning: ports.logWarning,
     exportVariable: (name, value) => {
-      if (value !== undefined) ports.setVariable(name, value);
+      if (value === undefined) return;
+      if (name === "PATH") ports.prependPath(value.split(path.delimiter)[0]!);
+      else ports.setVariable(name, value);
     },
   });
   if (runInstallEntries.length > 0) {
-    ports.runInstall(runInstallEntries, projectDir, installCommand, env);
+    await ports.runInstall(runInstallEntries, projectDir, installCommand, env);
   }
 
-  const versionOutput = ports.getCommandOutput("vp", ["--version"]) || "";
+  const versionOutput = ports.getCommandOutput("vp", ["--version"], { cwd: projectDir });
+  if (!versionOutput)
+    throw new Error(
+      "Failed to verify Vite+ installation: vp --version failed or returned no output.",
+    );
   ports.logInfo(versionOutput);
   const installedVersion = ports.parseInstalledVpVersion(versionOutput);
   ports.setVariable("SETUP_VP_INSTALLED_VERSION", installedVersion);
+  ports.setVariable("version", installedVersion, { isOutput: true });
+  ports.setVariable("cacheHit", String(env.SETUP_VP_CACHE_HIT === "true"), { isOutput: true });
 }
 
 export async function main(phase: AzurePhase): Promise<void> {

@@ -1,15 +1,18 @@
 import { createWriteStream, existsSync } from "node:fs";
-import { chmod, mkdtemp } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { get as httpGet } from "node:http";
-import { get as httpsGet } from "node:https";
+import type { get as httpGet } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { isWindows } from "./platform.js";
 import { commandPath } from "./process.js";
-import type { ExportVariable, InstallCommand, RunInstallEntry } from "./types.js";
+import { resolveSfwEnabled } from "./sfw.js";
+import type { ExportVariable, InstallCommand, LogFn, RunInstallEntry } from "./types.js";
 
-export const SFW_VERSION = "v1.15.0";
-const SFW_RELEASE_BASE = `https://github.com/SocketDev/sfw-free/releases/download/${SFW_VERSION}`;
+// All integrations use this version pin. Renovate updates it through
+// .github/renovate.json so reruns of the same commit download the same release.
+export const SFW_VERSION = "v1.15.4";
+export const SFW_RELEASE_BASE = `https://github.com/SocketDev/sfw-free/releases/download/${SFW_VERSION}`;
 const DOWNLOAD_TIMEOUT_MS = 60_000;
 type DownloadClient = typeof httpGet;
 
@@ -28,9 +31,6 @@ export function isMuslLinux(): boolean {
   return existsSync("/etc/alpine-release");
 }
 
-/**
- * Mirrors src/install-sfw.ts asset naming for portable CI runners.
- */
 export function getSfwAssetName(platform: NodeJS.Platform, arch: string, isMusl: boolean): string {
   if (platform === "darwin") {
     if (arch === "arm64") return "sfw-free-macos-arm64";
@@ -42,7 +42,7 @@ export function getSfwAssetName(platform: NodeJS.Platform, arch: string, isMusl:
     if (arch === "x64") {
       return isMusl ? "sfw-free-musl-linux-x86_64" : "sfw-free-linux-x86_64";
     }
-  } else if (platform === "win32") {
+  } else if (isWindows(platform)) {
     if (arch === "arm64") return "sfw-free-windows-arm64.exe";
     if (arch === "x64") return "sfw-free-windows-x86_64.exe";
   }
@@ -103,7 +103,6 @@ export function downloadFile(
     return Promise.resolve();
   }
 
-  const client = clientOverride || (url.startsWith("https:") ? httpsGet : httpGet);
   return new Promise((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error): void => {
@@ -117,7 +116,7 @@ export function downloadFile(
       }
     };
 
-    const request = client(url, (response) => {
+    const request = clientOverride(url, (response) => {
       const statusCode = response.statusCode ?? 0;
       const location = response.headers.location;
       if (statusCode >= 300 && statusCode < 400 && location) {
@@ -154,11 +153,14 @@ export async function setupSfw(
   options: {
     env?: NodeJS.ProcessEnv;
     sfwEnabled?: boolean;
+    vitePlusVersion?: string;
+    logWarning?: LogFn;
     exportVariable?: ExportVariable;
     platform?: NodeJS.Platform;
     arch?: string;
     isMusl?: boolean;
     download?: typeof downloadFile;
+    cacheDirectory?: string;
   } = {},
 ): Promise<InstallCommand> {
   const env = options.env ?? process.env;
@@ -168,50 +170,74 @@ export async function setupSfw(
   const isMusl = options.isMusl ?? isMuslLinux();
   const download = options.download ?? downloadFile;
 
-  if (!sfwEnabled) return "vp";
+  const effectiveSfw = resolveSfwEnabled(
+    sfwEnabled,
+    options.vitePlusVersion ?? "",
+    options.logWarning ?? console.warn,
+  );
+  if (!effectiveSfw) return { executable: "vp", sfw: false };
 
   if (runInstallEntries.length === 0) {
     console.log(
       "setup-vp: sfw was requested but run-install is disabled; sfw will not be invoked.",
     );
-    return "vp";
+    return { executable: "vp", sfw: false };
   }
 
-  const existing = commandPath("sfw");
+  const existing = commandPath("sfw", env);
   if (existing) {
     console.log(`setup-vp: using existing sfw on PATH: ${existing}`);
-    return "sfw";
+    return { executable: existing, sfw: true };
   }
 
-  let asset: string | undefined;
+  let asset: string;
   try {
     asset = getSfwAssetName(platform, arch, isMusl);
   } catch {
-    asset = undefined;
-  }
-  if (!asset) {
     console.error(
       `setup-vp: sfw has no published binary for this runner's platform/architecture (process.platform=${platform}, process.arch=${arch}, musl=${isMusl}) and none was found on PATH; falling back to plain vp install.`,
     );
-    return "vp";
+    return { executable: "vp", sfw: false };
   }
 
-  const sfwDir = await mkdtemp(path.join(tmpdir(), "setup-vp-sfw-"));
-  const sfwBin = path.join(sfwDir, platform === "win32" ? "sfw.exe" : "sfw");
+  const cacheDirectory = options.cacheDirectory || env.SETUP_VP_SFW_CACHE_DIR;
+  const sfwDir = cacheDirectory
+    ? path.resolve(cacheDirectory, SFW_VERSION, asset)
+    : await mkdtemp(path.resolve(tmpdir(), "setup-vp-sfw-"));
+  await mkdir(sfwDir, { recursive: true });
+  const sfwBin = path.join(sfwDir, isWindows(platform) ? "sfw.exe" : "sfw");
   const sfwUrl = `${SFW_RELEASE_BASE}/${asset}`;
+  function activate(): InstallCommand {
+    const pathSeparator = isWindows(platform) ? ";" : ":";
+    env.PATH = `${sfwDir}${pathSeparator}${env.PATH || ""}`;
+    options.exportVariable?.("PATH", env.PATH);
+    return { executable: sfwBin, sfw: true };
+  }
+  if (
+    await stat(sfwBin).then(
+      (file) => file.isFile() && file.size > 0,
+      () => false,
+    )
+  ) {
+    console.log(`setup-vp: using cached sfw ${SFW_VERSION}: ${sfwBin}`);
+    return activate();
+  }
 
   for (let round = 1; round <= 2; round += 1) {
+    const downloadDir = await mkdtemp(path.join(sfwDir, ".download-"));
+    const downloadPath = path.join(downloadDir, "sfw");
     try {
       console.log(`setup-vp: installing sfw ${SFW_VERSION} from ${sfwUrl}`);
-      await download(sfwUrl, sfwBin);
-      await chmod(sfwBin, 0o755);
-      const pathSeparator = platform === "win32" ? ";" : ":";
-      env.PATH = `${sfwDir}${pathSeparator}${env.PATH || ""}`;
-      options.exportVariable?.("PATH", env.PATH);
-      return "sfw";
+      await download(sfwUrl, downloadPath);
+      if ((await stat(downloadPath)).size === 0) throw new Error("Downloaded sfw binary is empty");
+      await chmod(downloadPath, 0o755);
+      await rename(downloadPath, sfwBin);
+      return activate();
     } catch (error) {
       if (round === 2) throw error;
       await new Promise((resolve) => setTimeout(resolve, 2000));
+    } finally {
+      await rm(downloadDir, { recursive: true, force: true });
     }
   }
 
