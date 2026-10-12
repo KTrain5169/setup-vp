@@ -103,14 +103,13 @@ steps:
 
 This will save the Vite+ task cache to GitHub Actions with a specific key. This only saves the task cache; other caches (from Vite builds, for example) that happen to be included in the `node_modules/.vite` folder is not included.
 
-At the end, the cache is written back to GitHub.
+At the end, the cache is written back to GitHub in the action's post step. The task cache is independent of the dependency cache, so `task-cache` saves on its own; set `task-cache-save: false` to restore without saving.
 
 ```yaml
 steps:
   - uses: actions/checkout@v6
   - uses: voidzero-dev/setup-vp@v1.17.0
     with:
-      cache: true
       task-cache: true
 ```
 
@@ -362,6 +361,8 @@ jobs:
 | `cache`                 | Enable caching of project dependencies                                                                             | No       | `false`               |
 | `cache-save`            | Save the dependency cache in the post action. Has no effect when `cache` is `false`                                | No       | `true`                |
 | `cache-dependency-path` | Path to lock file for cache key generation                                                                         | No       | Auto-detected         |
+| `task-cache`            | Save the Vite+ task cache to GitHub Actions Cache and restore it from a previous run                               | No       | `false`               |
+| `task-cache-save`       | Save the task cache in the post action. Has no effect when `task-cache` is `false`                                 | No       | `true`                |
 | `registry-url`          | Optional registry to set up for auth. Sets the registry in `.npmrc` and reads auth from `NODE_AUTH_TOKEN`          | No       |                       |
 | `scope`                 | Optional scope for scoped registries. Falls back to repo owner for GitHub Packages                                 | No       |                       |
 
@@ -448,6 +449,8 @@ For example, this workflow restores caches on every run but saves them only from
 ```
 
 Disabling cache saving doesn't change the `cache-hit` output, which continues to report whether the action restored a matching cache.
+
+The task cache has its own switch: `task-cache-save` controls it independently of `cache` and `cache-save`, so `task-cache: true` alone restores and saves the task cache. Set `task-cache-save: false` to restore it without saving, mirroring the table above for the task cache.
 
 ## GitLab CI/CD
 

@@ -39,6 +39,7 @@ const baseInputs: Inputs = {
   cacheSave: true,
   cacheDependencyPath: undefined,
   taskCache: false,
+  taskCacheSave: true,
   registryUrl: undefined,
   scope: undefined,
 };

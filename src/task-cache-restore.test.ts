@@ -35,8 +35,10 @@ const baseInputs: Inputs = {
   runInstall: [],
   sfw: false,
   cache: false,
+  cacheSave: true,
   cacheDependencyPath: undefined,
   taskCache: true,
+  taskCacheSave: true,
   registryUrl: undefined,
   scope: undefined,
 };

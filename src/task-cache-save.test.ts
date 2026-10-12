@@ -159,7 +159,7 @@ describe("saveTaskCache", () => {
     );
   });
 
-  it("saves cache with correct paths when matched key is different", async () => {
+  it("saves updated task cache when the matched key is from an older run attempt", async () => {
     stubSaveState({
       primaryKey: "vite-task-Linux-x64-12345-2",
       matchedKey: "vite-task-Linux-x64-12345-1",

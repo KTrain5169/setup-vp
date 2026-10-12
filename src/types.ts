@@ -32,6 +32,7 @@ export interface Inputs {
   readonly cacheSave: boolean;
   readonly cacheDependencyPath?: string;
   readonly taskCache: boolean;
+  readonly taskCacheSave: boolean;
   readonly registryUrl?: string;
   readonly scope?: string;
 }

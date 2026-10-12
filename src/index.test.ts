@@ -17,10 +17,18 @@ vi.mock("./inputs.js", () => ({
     sfw: false,
     cache: false,
     cacheSave: true,
+    taskCache: false,
+    taskCacheSave: true,
   }),
 }));
 vi.mock("./cache-save.js", () => ({
   saveCache: vi.fn(),
+}));
+vi.mock("./task-cache-restore.js", () => ({
+  restoreTaskCache: vi.fn(),
+}));
+vi.mock("./task-cache-save.js", () => ({
+  saveTaskCache: vi.fn(),
 }));
 vi.mock("@actions/exec", () => ({
   exec: vi.fn(),
@@ -41,18 +49,29 @@ import { runMain, runPost } from "./index.js";
 import { installVitePlus } from "./install-viteplus.js";
 import { setupSfw } from "./install-sfw.js";
 import { runViteInstall } from "./run-install.js";
+import { restoreTaskCache } from "./task-cache-restore.js";
+import { saveTaskCache } from "./task-cache-save.js";
 import { resolveVitePlusVersion } from "./version-file.js";
 import type { Inputs } from "./types.js";
 
 const mockedInfo = vi.mocked(info);
 const mockedSaveCache = vi.mocked(saveCache);
+const mockedRestoreTaskCache = vi.mocked(restoreTaskCache);
+const mockedSaveTaskCache = vi.mocked(saveTaskCache);
 
-const inputs = (cache: boolean, cacheSave: boolean): Inputs => ({
+const inputs = (
+  cache: boolean,
+  cacheSave: boolean,
+  taskCache = false,
+  taskCacheSave = true,
+): Inputs => ({
   version: "",
   runInstall: [],
   sfw: false,
   cache,
   cacheSave,
+  taskCache,
+  taskCacheSave,
 });
 
 describe("runMain sfw", () => {
@@ -87,9 +106,10 @@ describe("runPost", () => {
   });
 
   it("skips silently when caching is disabled", async () => {
-    await runPost(inputs(false, true));
+    await runPost(inputs(false, true, false));
 
     expect(mockedSaveCache).not.toHaveBeenCalled();
+    expect(mockedSaveTaskCache).not.toHaveBeenCalled();
     expect(mockedInfo).not.toHaveBeenCalled();
   });
 

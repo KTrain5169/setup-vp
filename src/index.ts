@@ -100,17 +100,20 @@ async function printViteVersion(cwd: string): Promise<void> {
 }
 
 export async function runPost(inputs: Inputs): Promise<void> {
-  if (!inputs.cache) return;
-
-  if (!inputs.cacheSave) {
-    info("Cache saving is disabled. Skipping cache save.");
-    return;
+  if (inputs.cache) {
+    if (!inputs.cacheSave) {
+      info("Cache saving is disabled. Skipping cache save.");
+    } else {
+      await saveCache();
+    }
   }
 
-  await saveCache();
-
   if (inputs.taskCache) {
-    await saveTaskCache();
+    if (!inputs.taskCacheSave) {
+      info("Task cache saving is disabled. Skipping task cache save.");
+    } else {
+      await saveTaskCache();
+    }
   }
 }
 
